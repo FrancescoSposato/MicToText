@@ -1,0 +1,8 @@
+# Core (CPU works with these alone)
+faster-whisper>=1.1.1
+ctranslate2>=4.5.0
+sounddevice>=0.4.7
+soundfile>=0.12.1
+numpy>=1.26
+requests>=2.31
+flask>=3.0

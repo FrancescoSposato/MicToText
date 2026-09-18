@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+cuda_libs/*.dll
+assets/mermaid.min.js
+
+# Stato locale di Claude Code
+.claude/scheduled_tasks.lock

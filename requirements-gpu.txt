@@ -1,0 +1,5 @@
+# CUDA 12 runtime libraries for CTranslate2 (faster-whisper on GPU).
+# cuBLAS >= 12.8 is required for RTX 50xx (Blackwell) GPUs. Download is ~1 GB.
+-r requirements.txt
+nvidia-cublas-cu12>=12.8
+nvidia-cudnn-cu12>=9.1,<10

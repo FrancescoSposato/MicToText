@@ -11,12 +11,31 @@ from mictotext.config import LlmConfig, RenderConfig
 from mictotext.html_export import write_html
 from mictotext.llm import OllamaClient
 
-# Prepended by the app (not by the LLM) so that theme and white background are guaranteed.
-INIT_DIRECTIVE = (
-    '%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", '
-    '"primaryColor": "#DCEBFA", "primaryTextColor": "#1F2937", "lineColor": "#7B8494", '
-    '"fontFamily": "Segoe UI, Helvetica, Arial, sans-serif"}}}%%'
-)
+# Prepended by the app (not by the LLM) so that layout, theme and white background are
+# guaranteed. The YAML frontmatter form is used because it is the only one that carries
+# `layout: elk`: ELK lays out graphs far more compactly than the legacy Dagre engine,
+# with orthogonal edge routing and fewer crossings. It applies to graph-based diagram
+# types only (flowchart, class, state, ER), which is all this app generates.
+_HEADER_TEMPLATE = """---
+config:
+  layout: {layout}
+  theme: base
+  themeVariables:
+    background: "#ffffff"
+    primaryColor: "#DCEBFA"
+    primaryTextColor: "#1F2937"
+    lineColor: "#7B8494"
+    fontFamily: "Segoe UI, Helvetica, Arial, sans-serif"
+---"""
+
+# ELK gives much better layouts but is less forgiving than Dagre with odd-but-parseable
+# graphs (it can throw instead of rendering), so Dagre stays as an automatic fallback.
+PRIMARY_LAYOUT = "elk"
+FALLBACK_LAYOUT = "dagre"
+
+
+def diagram_header(layout: str = PRIMARY_LAYOUT) -> str:
+    return _HEADER_TEMPLATE.format(layout=layout)
 
 _FENCE_RE = re.compile(r"`{3}(?:mermaid)?[ \t]*\n(.*?)`{3}", re.DOTALL | re.IGNORECASE)
 _START_RE = re.compile(r"^\s*(flowchart|graph)\s+(TD|TB|LR|RL|BT)\b", re.IGNORECASE)
@@ -55,7 +74,69 @@ def clean_mermaid(raw: str) -> str:
     code = "\n".join(lines[start:]).strip()
     for quote in _SMART_QUOTES:
         code = code.replace(quote, "'")
-    return code
+    return _strip_empty_subgraphs(_balance_subgraphs(code))
+
+
+def _balance_subgraphs(code: str) -> str:
+    """Append any missing `end` statements for unclosed subgraphs.
+
+    Small models routinely open several subgraphs and forget to close them, which makes
+    the whole diagram unparseable. Fixing it mechanically is far more reliable than asking
+    the model to repair its own output.
+    """
+    lines = code.splitlines()
+    opened = sum(1 for line in lines if line.strip().lower().startswith("subgraph "))
+    closed = sum(1 for line in lines if line.strip().lower() == "end")
+    missing = opened - closed
+    if missing <= 0:
+        return code
+
+    # Insert before the trailing styling block, so classDef/class/style stay at top level.
+    insert_at = len(lines)
+    for index in range(len(lines) - 1, -1, -1):
+        stripped = lines[index].strip().lower()
+        if stripped.startswith(("classdef ", "class ", "style ", "linkstyle ")):
+            insert_at = index
+        elif stripped:
+            break
+
+    print(f"  Auto-fixed {missing} unclosed subgraph(s).")
+    return "\n".join(lines[:insert_at] + ["  end"] * missing + lines[insert_at:])
+
+
+_SUBGRAPH_RE = re.compile(r"^\s*subgraph\s", re.IGNORECASE)
+_DECORATION_RE = re.compile(r"^\s*(classdef|class|style|linkstyle)\s", re.IGNORECASE)
+
+
+def _strip_empty_subgraphs(code: str) -> str:
+    """Drop subgraph blocks that declare no node, which make the ELK layout engine throw."""
+    lines = code.splitlines()
+    keep = [True] * len(lines)
+    index = 0
+    removed = 0
+    while index < len(lines):
+        if not _SUBGRAPH_RE.match(lines[index]):
+            index += 1
+            continue
+        end = next((j for j in range(index + 1, len(lines))
+                    if lines[j].strip().lower() == "end"), None)
+        if end is None:
+            break
+        body = lines[index + 1:end]
+        has_content = any(
+            line.strip() and not _DECORATION_RE.match(line) and not _SUBGRAPH_RE.match(line)
+            for line in body
+        )
+        if not has_content:
+            # Keep the decorations (they may define classes used elsewhere), drop the wrapper.
+            keep[index] = keep[end] = False
+            removed += 1
+        index = end + 1
+
+    if not removed:
+        return code
+    print(f"  Removed {removed} empty subgraph(s).")
+    return "\n".join(line for line, k in zip(lines, keep) if k)
 
 
 def _is_syntax_error(message: str) -> bool:
@@ -76,11 +157,25 @@ def _ask_for_code(client: OllamaClient, model: str, messages: list[dict], temper
     return code
 
 
-def _write_sources(code: str, mmd_path: Path, html_path: Path, render_cfg: RenderConfig) -> str:
-    full_code = f"{INIT_DIRECTIVE}\n{code}\n"
+def _write_sources(code: str, mmd_path: Path, html_path: Path, render_cfg: RenderConfig,
+                   layout: str = PRIMARY_LAYOUT) -> str:
+    full_code = f"{diagram_header(layout)}\n{code}\n"
     mmd_path.write_text(full_code, encoding="utf-8")
     write_html(full_code, html_path, render_cfg)
     return full_code
+
+
+def _render_with_layout_fallback(code: str, mmd_path: Path, html_path: Path,
+                                 render_cfg: RenderConfig, renderer, image_path: Path) -> tuple[bool, str]:
+    """Render with ELK; if ELK itself fails (not a syntax error), retry once with Dagre."""
+    _write_sources(code, mmd_path, html_path, render_cfg, PRIMARY_LAYOUT)
+    ok, output = renderer.render(mmd_path, image_path)
+    if ok or _is_syntax_error(output):
+        return ok, output
+
+    print(f"  {PRIMARY_LAYOUT} layout failed, retrying with {FALLBACK_LAYOUT}...")
+    _write_sources(code, mmd_path, html_path, render_cfg, FALLBACK_LAYOUT)
+    return renderer.render(mmd_path, image_path)
 
 
 def generate_diagram(notes_md: str, client: OllamaClient, model: str, llm_cfg: LlmConfig,
@@ -102,7 +197,8 @@ def generate_diagram(notes_md: str, client: OllamaClient, model: str, llm_cfg: L
     last_error = ""
     for attempt in range(render_cfg.max_fix_attempts + 1):
         print(f"  Rendering with {renderer.name} (attempt {attempt + 1})...")
-        ok, output = renderer.render(mmd_path, image_path)
+        ok, output = _render_with_layout_fallback(code, mmd_path, html_path, render_cfg,
+                                                  renderer, image_path)
         if ok:
             return DiagramResult(mmd_path, html_path, image_path)
 

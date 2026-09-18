@@ -22,7 +22,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 
 from mictotext.config import AppConfig, language_name
 from mictotext.diagram import generate_diagram
-from mictotext.llm import OllamaClient
+from mictotext.llm import OllamaClient, OllamaError
 from mictotext.notes import generate_notes
 from mictotext.recorder import MicRecorder, list_input_devices_structured
 from mictotext.renderer import build_renderer
@@ -187,6 +187,14 @@ def create_app(base_cfg: AppConfig) -> Flask:
             "notes_model": base_cfg.llm.notes_model,
             "diagram_model": base_cfg.llm.diagram_model or "",
         })
+
+    @app.get("/api/models")
+    def api_models():
+        """Models currently pulled in Ollama, to populate the UI dropdowns."""
+        try:
+            return jsonify(sorted(OllamaClient(base_cfg.llm).list_models()))
+        except OllamaError as exc:
+            return jsonify({"error": str(exc)}), 503
 
     @app.get("/api/status")
     def api_status():
@@ -369,11 +377,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </div>
       <div>
         <label for="notesModel">Modello Ollama (appunti)</label>
-        <input type="text" id="notesModel">
+        <select id="notesModel"></select>
       </div>
       <div>
-        <label for="diagramModel">Modello Ollama (schema, opzionale)</label>
-        <input type="text" id="diagramModel" placeholder="uguale al modello appunti">
+        <label for="diagramModel">Modello Ollama (schema)</label>
+        <select id="diagramModel"></select>
       </div>
     </div>
   </div>
@@ -413,12 +421,37 @@ INDEX_HTML = r"""<!DOCTYPE html>
 let statusPolling = null;
 let levelPolling = null;
 
-async function loadDefaults() {
-  const res = await fetch('/api/defaults');
-  const data = await res.json();
-  document.getElementById('language').value = data.language;
-  document.getElementById('notesModel').value = data.notes_model;
-  document.getElementById('diagramModel').value = data.diagram_model;
+async function loadModelsAndDefaults() {
+  const [modelsRes, defaultsRes] = await Promise.all([
+    fetch('/api/models'), fetch('/api/defaults')
+  ]);
+  const models = await modelsRes.json();
+  const defaults = await defaultsRes.json();
+
+  document.getElementById('language').value = defaults.language;
+
+  const notesSel = document.getElementById('notesModel');
+  const diagSel = document.getElementById('diagramModel');
+  notesSel.innerHTML = '';
+  diagSel.innerHTML = '';
+  // Empty value = "same as the notes model" (the backend falls back to it).
+  diagSel.appendChild(new Option('(uguale al modello appunti)', ''));
+
+  const list = Array.isArray(models) ? models : [];
+  if (list.length === 0) {
+    notesSel.appendChild(new Option('Nessun modello in Ollama', ''));
+    showError(models.error || 'Nessun modello trovato in Ollama. Scaricane uno con: ollama pull <modello>');
+    return;
+  }
+  list.forEach(m => {
+    notesSel.appendChild(new Option(m, m));
+    diagSel.appendChild(new Option(m, m));
+  });
+
+  if (list.includes(defaults.notes_model)) notesSel.value = defaults.notes_model;
+  if (defaults.diagram_model && list.includes(defaults.diagram_model)) {
+    diagSel.value = defaults.diagram_model;
+  }
 }
 
 async function loadDevices() {
@@ -584,7 +617,7 @@ async function restoreState() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  loadDefaults();
+  loadModelsAndDefaults();
   loadDevices();
   restoreState();
 });

@@ -46,7 +46,7 @@ class SttConfig:
 @dataclass
 class LlmConfig:
     base_url: str = "http://127.0.0.1:11434"
-    notes_model: str = "qwen2.5:7b"
+    notes_model: str = "dolphin3:8b"
     diagram_model: str | None = None  # None = same as notes_model
     num_ctx: int = 16384
     notes_temperature: float = 0.3

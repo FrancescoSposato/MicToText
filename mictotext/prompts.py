@@ -63,20 +63,48 @@ Output ONLY the Markdown document: no preamble, no closing remarks, no code fenc
 
 NOTES_MERGE_USER = "Partial notes:\n\n{parts}"
 
-DIAGRAM_SYSTEM = """You are an expert at turning structured notes into ONE clear Mermaid diagram.
+DIAGRAM_SYSTEM = """You are an expert at turning structured notes into ONE clear conceptual diagram \
+in Mermaid syntax.
+
+WHAT THE DIAGRAM MUST REPRESENT (most important section):
+The diagram is a map of the IDEAS and of HOW THEY RELATE TO EACH OTHER. It is NOT a picture of \
+the notes document and NOT a table of contents.
+
+- NEVER create a node or a subgraph for the document's structural sections. Specifically forbidden \
+as nodes/subgraphs: "Summary", "Sintesi", "Key terms", "Termini chiave", "Glossario", \
+"Open questions", "Domande aperte", "Next steps", "Prossimi passi", "Introduzione", "Conclusione". \
+Those are scaffolding of the write-up, not content. Take the CONCEPTS described inside those \
+sections and place them in the diagram connected to the ideas they belong to.
+- A definition from "Key terms" becomes the node of that concept, used where the concept acts.
+- An open question becomes an edge or a node only if it expresses a real relation between concepts.
+- Do NOT simply mirror the heading hierarchy with one chain of bullets per heading. That produces a \
+bulleted list drawn as boxes, which is useless.
+- The value of the diagram is in the NON-hierarchical links: cause -> effect, problem -> solution, \
+condition -> consequence, opposition, dependency, before -> after. Include at least 3 such links \
+whenever the content allows it, and put a short label on them.
 
 Syntax rules (strict):
-1. Output ONLY Mermaid code. No Markdown code fences, no explanations, no %%{{init}}%% directive.
-2. The first line must be "flowchart TD" (use "flowchart LR" only for sequences or timelines).
+1. Output ONLY Mermaid code. No Markdown code fences, no explanations, no frontmatter, \
+no %%{{init}}%% directive.
+2. The first line must be exactly "flowchart TD". Never use LR, RL or BT: the diagram is embedded \
+in a vertical document, and left-to-right charts come out as an unreadable wide strip.
 3. Node IDs: short ASCII identifiers with letters, digits and underscores only (e.g. N1, cause_2). \
 Never use reserved words as IDs: end, graph, flowchart, subgraph, class, classDef, style, click, default.
 4. EVERY node label must be wrapped in double quotes: N1["Label text"]. Never put double quotes \
 inside a label (use single quotes instead). Use <br/> for line breaks. No Markdown inside labels.
 5. Edges: A --> B or A -->|"short label"| B. Edge labels: 1-3 words.
 6. Group related nodes in subgraphs: subgraph SG_1["Topic title"] ... end. Every subgraph needs its own "end".
-7. Readability: between 8 and 30 nodes, labels of at most ~8 words. Mirror the hierarchy of the \
-notes (main topic -> subtopics -> key points) and show cause/effect or sequence relations when present.
-8. All labels must be written in {language}.
+7. LABEL LENGTH IS A HARD LIMIT: maximum 8 words per node label, and shorter is better. Condense \
+the idea into a phrase, never copy a whole sentence from the notes. If a bullet reads "Gli utenti \
+anziani possono sentirsi intimiditi dalla tecnologia", the node is "Utente anziano intimidito". \
+A node that contains a full sentence is a failure.
+8. Size: between 8 and 25 nodes. Prefer fewer, sharper nodes over many verbose ones.
+8b. SHAPE OF THE GRAPH: never build one single long chain (A -> B -> C -> D -> E ...). A chain \
+renders as an unusable strip. Keep the longest path at most 4 nodes deep, and instead make the \
+graph BRANCH and CONVERGE: several causes pointing at one effect, one concept feeding several \
+consequences, two solutions addressing the same problem. A good diagram is wide in the middle, \
+not long.
+9. All labels must be written in {language}.
 
 Visual style (mandatory):
 - Colour nodes and subgraphs with soft PASTEL tints that are CONSISTENT BY CATEGORY: all nodes of \
@@ -97,30 +125,42 @@ nodes and subgraphs.
   style SG_4 fill:#FAF6FD,stroke:#A98BCB,color:#1F2937   (example)
   style SG_5 fill:#FDF4F4,stroke:#D98A8A,color:#1F2937   (issue)
 
-Example of valid output (content is only illustrative):
+Example of valid output (content is only illustrative). Note the SHORT labels and the LABELLED \
+cause/effect links that cross between subgraphs - that is what makes a diagram useful:
 flowchart TD
-  ROOT["Fotosintesi"]
-  subgraph SG_1["Fase luminosa"]
-    A1["Assorbimento della luce"]
-    A2["Produzione di ATP e NADPH"]
+  ROOT["Usabilita del software"]
+  subgraph SG_1["Cause"]
+    C1["Design poco intuitivo"]
+    C2["Istruzioni assenti"]
   end
-  subgraph SG_2["Ciclo di Calvin"]
-    B1["Fissazione della CO2"]
-    B2["Sintesi del glucosio"]
+  subgraph SG_2["Effetti"]
+    E1["Curva ripida"]
+    E2["Utente intimidito"]
+    E3["Abbandono del prodotto"]
   end
-  ROOT --> SG_1
-  ROOT --> SG_2
-  A1 --> A2
-  A2 -->|"energia"| B1
-  B1 --> B2
+  subgraph SG_3["Soluzioni"]
+    S1["Funzioni ben etichettate"]
+    S2["Riuso di schemi noti"]
+  end
+  ROOT --> C1
+  ROOT --> C2
+  C1 -->|"provoca"| E1
+  C2 -->|"provoca"| E1
+  E1 -->|"porta a"| E2
+  E2 -->|"rischio"| E3
+  S1 -->|"riduce"| E1
+  S2 -->|"riduce"| E2
   classDef main fill:#DCEBFA,stroke:#6E9BD1,stroke-width:2px,color:#1F2937
+  classDef issue fill:#FBE1E1,stroke:#D98A8A,color:#1F2937
   classDef concept fill:#E3F4E8,stroke:#79B791,color:#1F2937
   classDef process fill:#FFF3D6,stroke:#D6AE55,color:#1F2937
   class ROOT main
-  class A1,B1 concept
-  class A2,B2 process
-  style SG_1 fill:#F6FBF7,stroke:#79B791,color:#1F2937
-  style SG_2 fill:#FFFBF0,stroke:#D6AE55,color:#1F2937"""
+  class C1,C2 issue
+  class E1,E2,E3 concept
+  class S1,S2 process
+  style SG_1 fill:#FDF4F4,stroke:#D98A8A,color:#1F2937
+  style SG_2 fill:#F6FBF7,stroke:#79B791,color:#1F2937
+  style SG_3 fill:#FFFBF0,stroke:#D6AE55,color:#1F2937"""
 
 DIAGRAM_USER = "Create the Mermaid diagram for these notes:\n\n{notes}"
 

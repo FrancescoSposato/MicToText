@@ -11,6 +11,7 @@ import requests
 from mictotext.config import LlmConfig
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_UNSET = object()  # distinguishes "not passed" from an explicit None/False
 
 
 class OllamaError(RuntimeError):
@@ -47,8 +48,13 @@ class OllamaClient:
             commands = "\n".join(f"  ollama pull {m}" for m in missing)
             raise OllamaError(f"Missing model(s) in Ollama. Run:\n{commands}")
 
-    def chat(self, model: str, messages: list[dict], temperature: float, echo: bool = True) -> str:
-        """Send a chat request, streaming tokens to the console. Returns the full reply."""
+    def chat(self, model: str, messages: list[dict], temperature: float, echo: bool = True,
+             think: bool | None = _UNSET) -> str:
+        """Send a chat request, streaming tokens to the console. Returns the full reply.
+
+        `think` overrides the configured default for this call: reasoning is worth its
+        cost when generating content from the transcript, not when reformatting notes.
+        """
         payload: dict = {
             "model": model,
             "messages": messages,
@@ -56,8 +62,9 @@ class OllamaClient:
             "keep_alive": self.cfg.keep_alive,
             "options": {"temperature": temperature, "num_ctx": self.cfg.num_ctx},
         }
-        if self.cfg.think is not None:
-            payload["think"] = self.cfg.think
+        effective_think = self.cfg.think if think is _UNSET else think
+        if effective_think is not None:
+            payload["think"] = effective_think
 
         parts: list[str] = []
         try:

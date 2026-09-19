@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from mictotext.config import AppConfig, language_name
+from mictotext.config import THINKING_LEVELS, AppConfig, language_name
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Local pipeline: microphone -> transcript -> Markdown notes -> Mermaid diagram.",
     )
     source = parser.add_argument_group("input shortcuts (skip earlier steps)")
+    source.add_argument("--url", help="download audio from a video URL (YouTube and many others)")
     source.add_argument("--audio", type=Path, help="use an existing audio file instead of recording")
     source.add_argument("--transcript", type=Path, help="use an existing .txt transcript (skips recording and STT)")
     source.add_argument("--notes", type=Path, help="use an existing Markdown file (only generates the diagram)")
@@ -36,7 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     llm.add_argument("--llm-model", help="Ollama model for notes (default: qwen2.5:7b)")
     llm.add_argument("--diagram-model", help="Ollama model for Mermaid (default: same as --llm-model)")
     llm.add_argument("--num-ctx", type=int, help="context window in tokens (default: 16384)")
-    llm.add_argument("--no-think", action="store_true", help="send think=false (for reasoning models, e.g. qwen3)")
+    llm.add_argument("--thinking", choices=["none", "notes", "full"],
+                     help="how much internal reasoning to spend: none (fast, may invent), "
+                          "notes (default, reasons only where content is created), full (slow)")
     llm.add_argument("--ollama-url", help="Ollama base URL (default: http://127.0.0.1:11434)")
 
     render = parser.add_argument_group("diagram rendering")
@@ -46,6 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--puppeteer-config", help="puppeteer config JSON path, as seen by mmdc")
     render.add_argument("--format", choices=["png", "svg"], help="image format (default: png)")
 
+    llm.add_argument("--cards", type=int, metavar="N",
+                     help="discursive concept cards to generate (default: 4, 0 disables)")
     parser.add_argument("--out-dir", type=Path, help="output folder (default: output/<timestamp>)")
     parser.add_argument("--no-open", action="store_true", help="do not open the result when finished")
     return parser
@@ -74,8 +79,12 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         cfg.llm.diagram_model = args.diagram_model
     if args.num_ctx:
         cfg.llm.num_ctx = args.num_ctx
-    if args.no_think:
-        cfg.llm.think = False
+    if args.cards is not None:
+        cfg.llm.concept_cards = max(0, args.cards)
+    if args.thinking:
+        level = THINKING_LEVELS[args.thinking]
+        cfg.llm.think_notes = level["think_notes"]
+        cfg.llm.think = level["think"]
     if args.ollama_url:
         cfg.llm.base_url = args.ollama_url
 
@@ -140,6 +149,13 @@ def run(args: argparse.Namespace, cfg: AppConfig) -> int:
                 transcript_text = args.transcript.read_text(encoding="utf-8")
             else:
                 audio_path = args.audio.resolve() if args.audio else None
+                if audio_path is None and args.url:
+                    from mictotext.fetch import download_audio
+                    _step("1/4 Download")
+                    media = download_audio(args.url, session_dir)
+                    audio_path = media.path
+                    length = f", {media.duration / 60:.1f} min" if media.duration else ""
+                    print(f"  {media.title}{length}")
                 if audio_path is None:
                     from mictotext.recorder import record_until_enter
                     _step("1/4 Recording")
@@ -174,6 +190,22 @@ def run(args: argparse.Namespace, cfg: AppConfig) -> int:
                                   session_dir, language_name(output_language))
         timings["diagram"] = time.perf_counter() - started
 
+        if cfg.llm.concept_cards > 0:
+            from mictotext.diagram import extract_concepts, generate_concept_cards
+            _step("Schede concetto")
+            started = time.perf_counter()
+            concepts = extract_concepts(notes_md, client, diagram_model, cfg.llm,
+                                        language_name(output_language), cfg.llm.concept_cards)
+            if concepts:
+                print(f"  Concetti selezionati: {', '.join(concepts)}")
+                cards = generate_concept_cards(notes_md, concepts, client, diagram_model, cfg.llm,
+                                               cfg.render, renderer, session_dir,
+                                               language_name(output_language))
+                print(f"\n  {len(cards)} scheda/e prodotta/e in concetti/")
+            else:
+                print("  Nessun concetto adatto a una scheda.")
+            timings["cards"] = time.perf_counter() - started
+
     except RuntimeError as exc:  # includes OllamaError and DiagramError
         kind = "LLM" if isinstance(exc, OllamaError) else "Diagram" if isinstance(exc, DiagramError) else "Pipeline"
         print(f"\nERROR ({kind}): {exc}")
@@ -192,9 +224,10 @@ def run(args: argparse.Namespace, cfg: AppConfig) -> int:
             _open_file(result.image_path)
     else:
         print(f"\nImage not rendered ({result.error.splitlines()[-1] if result.error else 'unknown reason'}).")
-        print(f"Open the HTML fallback instead: {result.html_path}")
-        if not args.no_open:
-            _open_file(result.html_path)
+        if result.html_path:
+            print(f"Open the HTML fallback instead: {result.html_path}")
+            if not args.no_open:
+                _open_file(result.html_path)
     return 0
 
 

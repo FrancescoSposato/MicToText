@@ -6,3 +6,5 @@ soundfile>=0.12.1
 numpy>=1.26
 requests>=2.31
 flask>=3.0
+# Audio download from video URLs (no external FFmpeg needed: PyAV decodes the stream)
+yt-dlp>=2026.8

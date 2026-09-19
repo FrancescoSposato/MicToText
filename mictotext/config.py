@@ -17,6 +17,16 @@ LANGUAGE_NAMES = {
 }
 
 
+# How much internal reasoning to spend. Reasoning is what checks claims against the
+# transcript, so it matters where content is created; it is mostly wasted time where the
+# model only re-shapes notes that are already written.
+THINKING_LEVELS = {
+    "none":  {"think_notes": False, "think": False},
+    "notes": {"think_notes": True,  "think": False},
+    "full":  {"think_notes": True,  "think": True},
+}
+
+
 def language_name(code: str | None) -> str:
     """Return a human-readable language name for use inside LLM prompts."""
     if not code:
@@ -51,10 +61,20 @@ class LlmConfig:
     num_ctx: int = 16384
     notes_temperature: float = 0.3
     diagram_temperature: float = 0.2
-    think: bool | None = None  # set False for reasoning models such as qwen3
+    # Reasoning is applied per step, because it buys fidelity but costs a lot of time.
+    # Measured on the same 30s source with qwen3.5:9b: notes took 119s with reasoning and
+    # 26s without, but the fast version invented content that was not in the transcript
+    # (gravitational potential, atomic clocks). Reasoning is what checks claims against
+    # the source, so it stays ON where content is created from the transcript, and OFF for
+    # the diagram/card steps, which only re-shape notes that are already written.
+    # Accepted by non-reasoning models too, so it is safe as a default.
+    think_notes: bool | None = True
+    think: bool | None = False
     keep_alive: str = "10m"
     request_timeout: int = 600  # seconds between streamed chunks
     chunk_chars: int = 12000  # longer transcripts are processed in parts
+    concept_cards: int = 4  # discursive cards to generate after the main diagram (0 = off)
+    min_labeled_edge_ratio: float = 0.5  # below this, the main diagram is sent back for revision
 
 
 @dataclass

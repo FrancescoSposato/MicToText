@@ -50,7 +50,7 @@ def generate_notes(transcript: str, client: OllamaClient, model: str, cfg: LlmCo
             {"role": "system", "content": prompts.NOTES_SYSTEM.format(language=language)},
             {"role": "user", "content": prompts.NOTES_USER.format(transcript=text)},
         ]
-        return _clean(client.chat(model, messages, cfg.notes_temperature))
+        return _clean(client.chat(model, messages, cfg.notes_temperature, think=cfg.think_notes))
 
     print(f"  Long transcript: processing {len(chunks)} parts, then merging.")
     partial_notes: list[str] = []
@@ -61,7 +61,8 @@ def generate_notes(transcript: str, client: OllamaClient, model: str, cfg: LlmCo
                 language=language, index=index, total=len(chunks))},
             {"role": "user", "content": prompts.NOTES_USER.format(transcript=chunk)},
         ]
-        partial_notes.append(_clean(client.chat(model, messages, cfg.notes_temperature)))
+        partial_notes.append(_clean(client.chat(model, messages, cfg.notes_temperature,
+                                                   think=cfg.think_notes)))
 
     print("\n  --- Merging parts ---")
     joined = "\n\n".join(f"<!-- part {i} -->\n{notes}" for i, notes in enumerate(partial_notes, start=1))
@@ -69,4 +70,4 @@ def generate_notes(transcript: str, client: OllamaClient, model: str, cfg: LlmCo
         {"role": "system", "content": prompts.NOTES_MERGE_SYSTEM.format(language=language)},
         {"role": "user", "content": prompts.NOTES_MERGE_USER.format(parts=joined)},
     ]
-    return _clean(client.chat(model, messages, cfg.notes_temperature))
+    return _clean(client.chat(model, messages, cfg.notes_temperature, think=cfg.think_notes))

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 from mictotext import prompts
 from mictotext.config import LlmConfig, RenderConfig
 from mictotext.html_export import write_html
-from mictotext.llm import OllamaClient
+from mictotext.llm import OllamaClient, OllamaError
 
 # Prepended by the app (not by the LLM) so that layout, theme and white background are
 # guaranteed. The YAML frontmatter form is used because it is the only one that carries
@@ -25,8 +26,10 @@ config:
     primaryColor: "#DCEBFA"
     primaryTextColor: "#1F2937"
     lineColor: "#7B8494"
-    fontFamily: "Segoe UI, Helvetica, Arial, sans-serif"
 ---"""
+# NOTE: do not set `fontFamily` here. Mermaid measures the label box with one font and
+# the headless Chromium renders with another, so a custom family silently clips long
+# labels (node titles came out truncated). Its own default keeps the two in sync.
 
 # ELK gives much better layouts but is less forgiving than Dagre with odd-but-parseable
 # graphs (it can throw instead of rendering), so Dagre stays as an automatic fallback.
@@ -51,7 +54,7 @@ class DiagramError(RuntimeError):
 @dataclass
 class DiagramResult:
     mmd_path: Path
-    html_path: Path
+    html_path: Path | None  # only written when no image could be rendered
     image_path: Path | None
     error: str = ""
 
@@ -158,10 +161,17 @@ def _ask_for_code(client: OllamaClient, model: str, messages: list[dict], temper
 
 
 def _write_sources(code: str, mmd_path: Path, html_path: Path, render_cfg: RenderConfig,
-                   layout: str = PRIMARY_LAYOUT) -> str:
+                   layout: str = PRIMARY_LAYOUT, with_html: bool = False) -> str:
+    """Write the .mmd source, and the browser fallback page only when asked.
+
+    The HTML page is not produced on a successful render: the PNG is the deliverable and
+    an extra file per diagram is just clutter. It is still written when no image could be
+    made, so a failure does not leave only unrendered Mermaid source behind.
+    """
     full_code = f"{diagram_header(layout)}\n{code}\n"
     mmd_path.write_text(full_code, encoding="utf-8")
-    write_html(full_code, html_path, render_cfg)
+    if with_html:
+        write_html(full_code, html_path, render_cfg)
     return full_code
 
 
@@ -189,9 +199,30 @@ def generate_diagram(notes_md: str, client: OllamaClient, model: str, llm_cfg: L
         {"role": "user", "content": prompts.DIAGRAM_USER.format(notes=notes_md)},
     ]
     code = _ask_for_code(client, model, messages, llm_cfg.diagram_temperature)
+
+    # Quality gate: a graph of unlabelled arrows between topic titles explains nothing.
+    # Prompting alone does not reliably produce labels, so measure it and send it back once.
+    labeled, total = labeled_edge_ratio(code)
+    if total >= 4 and labeled / total < llm_cfg.min_labeled_edge_ratio:
+        print(f"\n  Solo {labeled}/{total} archi etichettati: chiedo una revisione...")
+        messages.append({"role": "user", "content": prompts.DIAGRAM_LABEL_FIX.format(
+            labeled=labeled, total=total)})
+        try:
+            revised = _ask_for_code(client, model, messages, llm_cfg.diagram_temperature)
+            new_labeled, new_total = labeled_edge_ratio(revised)
+            if new_total and new_labeled / new_total > labeled / max(total, 1):
+                code = revised
+                print(f"  Revisione accettata: {new_labeled}/{new_total} archi etichettati.")
+            else:
+                print("  Revisione non migliorativa: tengo la versione originale.")
+        except (DiagramError, OllamaError) as exc:
+            print(f"  Revisione fallita ({exc}): tengo la versione originale.")
+
     _write_sources(code, mmd_path, html_path, render_cfg)
 
     if renderer is None:
+        # Without mmdc the browser page is the only viewable output, so it is written.
+        _write_sources(code, mmd_path, html_path, render_cfg, with_html=True)
         return DiagramResult(mmd_path, html_path, None, "No mermaid-cli renderer available.")
 
     last_error = ""
@@ -200,7 +231,7 @@ def generate_diagram(notes_md: str, client: OllamaClient, model: str, llm_cfg: L
         ok, output = _render_with_layout_fallback(code, mmd_path, html_path, render_cfg,
                                                   renderer, image_path)
         if ok:
-            return DiagramResult(mmd_path, html_path, image_path)
+            return DiagramResult(mmd_path, None, image_path)
 
         last_error = output
         print(f"  Render failed:\n    " + "\n    ".join(output.splitlines()[-6:]))
@@ -219,4 +250,98 @@ def generate_diagram(notes_md: str, client: OllamaClient, model: str, llm_cfg: L
             break
         _write_sources(code, mmd_path, html_path, render_cfg)
 
+    # No image could be produced: fall back to the browser page so something is viewable.
+    _write_sources(code, mmd_path, html_path, render_cfg, with_html=True)
     return DiagramResult(mmd_path, html_path, None, last_error)
+
+
+# --- Edge-label quality gate --------------------------------------------------------
+
+_EDGE_RE = re.compile(r"--[->]")
+_LABELED_EDGE_RE = re.compile(r"--[->]\s*\|")
+
+
+def labeled_edge_ratio(code: str) -> tuple[int, int]:
+    """Return (labelled arrows, total arrows). Unlabelled arrows explain nothing."""
+    total = len(_EDGE_RE.findall(code))
+    labeled = len(_LABELED_EDGE_RE.findall(code))
+    return labeled, total
+
+
+# --- Discursive concept cards -------------------------------------------------------
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(text: str) -> str:
+    normalised = unicodedata.normalize("NFKD", text.lower())
+    ascii_text = normalised.encode("ascii", "ignore").decode("ascii")
+    return _SLUG_RE.sub("-", ascii_text).strip("-")[:40] or "concetto"
+
+
+def extract_concepts(notes_md: str, client: OllamaClient, model: str, llm_cfg: LlmConfig,
+                     language: str, max_concepts: int) -> list[str]:
+    """Ask the model which concepts deserve their own explanation card."""
+    messages = [
+        {"role": "system", "content": prompts.CONCEPTS_SYSTEM.format(
+            language=language, max_concepts=max_concepts)},
+        {"role": "user", "content": prompts.CONCEPTS_USER.format(notes=notes_md)},
+    ]
+    raw = client.chat(model, messages, llm_cfg.diagram_temperature)
+    concepts = []
+    for line in raw.splitlines():
+        cleaned = line.strip().lstrip("-*0123456789. ").strip()
+        # Guard against the model echoing the document's scaffolding sections.
+        if cleaned and not _is_scaffolding(cleaned) and len(cleaned) <= 60:
+            concepts.append(cleaned)
+    return concepts[:max_concepts]
+
+
+_SCAFFOLDING = ("summary", "sintesi", "key terms", "termini chiave", "glossario",
+                "open questions", "domande aperte", "next steps", "prossimi passi",
+                "introduzione", "conclusione", "conclusioni")
+
+
+def _is_scaffolding(text: str) -> bool:
+    lowered = text.lower().strip(": ")
+    return any(lowered.startswith(marker) for marker in _SCAFFOLDING)
+
+
+def generate_concept_cards(notes_md: str, concepts: list[str], client: OllamaClient, model: str,
+                           llm_cfg: LlmConfig, render_cfg: RenderConfig, renderer,
+                           output_dir: Path, language: str) -> list[Path]:
+    """Generate one discursive card per concept. A failing card is skipped, not fatal."""
+    cards_dir = output_dir / "concetti"
+    cards_dir.mkdir(parents=True, exist_ok=True)
+    produced: list[Path] = []
+
+    for index, concept in enumerate(concepts, start=1):
+        stem = f"{index:02d}-{_slug(concept)}"
+        print(f"\n  --- Scheda {index}/{len(concepts)}: {concept} ---")
+        messages = [
+            {"role": "system", "content": prompts.CARD_SYSTEM.format(
+                concept=concept, language=language)},
+            {"role": "user", "content": prompts.CARD_USER.format(concept=concept, notes=notes_md)},
+        ]
+        try:
+            code = _ask_for_code(client, model, messages, llm_cfg.diagram_temperature)
+        except (DiagramError, OllamaError) as exc:
+            print(f"  Scheda saltata ({exc}).")
+            continue
+
+        mmd_path = cards_dir / f"{stem}.mmd"
+        html_path = cards_dir / f"{stem}.html"
+        image_path = cards_dir / f"{stem}.{render_cfg.image_format}"
+        if renderer is None:
+            _write_sources(code, mmd_path, html_path, render_cfg, with_html=True)
+            continue
+
+        ok, output = _render_with_layout_fallback(code, mmd_path, html_path, render_cfg,
+                                                  renderer, image_path)
+        if ok:
+            produced.append(image_path)
+        else:
+            print(f"  Render della scheda fallito: {output.splitlines()[-1][:120] if output else '?'}")
+            _write_sources(code, mmd_path, html_path, render_cfg, with_html=True)
+
+    return produced

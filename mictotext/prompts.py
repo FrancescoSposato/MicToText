@@ -82,6 +82,13 @@ bulleted list drawn as boxes, which is useless.
 - The value of the diagram is in the NON-hierarchical links: cause -> effect, problem -> solution, \
 condition -> consequence, opposition, dependency, before -> after. Include at least 3 such links \
 whenever the content allows it, and put a short label on them.
+- THE SENTENCE TEST, which every edge must pass: reading "<source node> <edge label> <target node>" \
+out loud must produce a meaningful sentence. "Campo gravitazionale intenso" + "rallenta" + "Tempo \
+dell'orologio" works. An unlabelled arrow between two topic titles does not: it carries no \
+information and is the main reason a diagram ends up explaining nothing.
+- The root node should be the QUESTION the content answers, not the title of the subject. Prefer \
+"Perché gli orologi in basso rallentano?" over "Il tempo e la fisica". This orients the whole \
+graph towards an explanation.
 
 Syntax rules (strict):
 1. Output ONLY Mermaid code. No Markdown code fences, no explanations, no frontmatter, \
@@ -177,3 +184,97 @@ DIAGRAM_FORMAT_REMINDER = (
     "Your answer did not contain valid Mermaid flowchart code. "
     "Output ONLY the Mermaid code, starting with the line 'flowchart TD'."
 )
+
+
+# --- Concept extraction -------------------------------------------------------------
+
+CONCEPTS_SYSTEM = """You pick the key concepts that deserve a detailed explanation card.
+
+Rules:
+- Choose at most {max_concepts} concepts, fewer if the content is thin.
+- Pick concepts that are actually EXPLAINED or USED in the notes, never the document's \
+structural sections ("Summary", "Key terms", "Open questions", "Conclusione").
+- Prefer concepts a student would need explained: technical terms, mechanisms, phenomena, \
+named effects. Skip generic words.
+- Write each concept in {language}, as a short noun phrase (2-5 words), one per line.
+- Output ONLY the list, one concept per line, no numbering, no bullets, no preamble."""
+
+CONCEPTS_USER = "Notes:\n\n{notes}"
+
+
+# --- Discursive concept cards -------------------------------------------------------
+
+CARD_SYSTEM = """You explain ONE concept as a small, mostly linear Mermaid diagram: a "concept \
+card". This is NOT a relational map: it is a written explanation laid out in blocks.
+
+The concept to explain: {concept}
+
+Content of each block - follow this sequence, skipping a block only if the notes truly say \
+nothing about it:
+1. The concept name, in capitals, as the first node.
+2. "Definizione: ..." - what it is, in one or two complete sentences.
+3. "Come funziona: ..." - the mechanism or the reason behind it, in one or two complete sentences.
+4. "Esempio: ..." - a concrete example. Use an example from the notes when there is one.
+5. "Attenzione: ..." - the typical misunderstanding or the thing that is easy to get wrong. \
+Include it only if you can ground it in the notes; do not invent one.
+
+WRITING STYLE - this is the opposite of a relational diagram:
+- Each block contains COMPLETE SENTENCES, roughly 15 to 40 words. Real prose, not labels.
+- Do NOT compress into keywords: these blocks exist precisely to carry the wording a short \
+label cannot hold.
+- Break long text with <br/> roughly every 8-10 words, so the block stays narrow and readable.
+- Write in {language}, using proper accented characters (più, è, perché), never ASCII
+substitutes like piu' or e'.
+- Stay strictly within what the notes say. If the notes do not support a block, leave it out \
+rather than filling it with general knowledge. Inventing plausible-sounding material is the \
+worst possible failure here.
+
+Syntax rules (strict):
+1. Output ONLY Mermaid code: no code fences, no explanations, no frontmatter, no %%{{init}}%% directive.
+2. First line exactly "flowchart TD".
+3. Node IDs: short ASCII identifiers (T, D, M, E, W). Never use reserved words.
+4. Every label in double quotes; never a double quote inside a label (use single quotes); \
+<br/> for line breaks; no Markdown inside labels.
+5. Connect the blocks in a single simple chain: T --> D --> M --> E --> W. No subgraphs, \
+no branching, no edge labels. The structure is deliberately plain.
+6. Between 3 and 5 nodes in total.
+
+Visual style: the title node uses the "title" class, the others alternate the pastel classes below. \
+Canvas background stays white; colour only the nodes.
+  classDef title fill:#DCEBFA,stroke:#6E9BD1,stroke-width:2px,color:#1F2937
+  classDef definition fill:#E3F4E8,stroke:#79B791,color:#1F2937
+  classDef mechanism fill:#FFF3D6,stroke:#D6AE55,color:#1F2937
+  classDef example fill:#F1E6FA,stroke:#A98BCB,color:#1F2937
+  classDef warning fill:#FBE1E1,stroke:#D98A8A,color:#1F2937
+
+Example of the expected output and writing density:
+flowchart TD
+  T["DILATAZIONE GRAVITAZIONALE DEL TEMPO"]
+  D["Definizione: il tempo non scorre allo stesso<br/>ritmo ovunque, ma più lentamente dove<br/>il campo gravitazionale è più intenso."]
+  M["Come funziona: la massa della Terra curva lo<br/>spaziotempo, e più si è vicini alla sorgente<br/>del campo più il tempo proprio rallenta."]
+  E["Esempio: un orologio al piano terra segna un<br/>tempo che scorre più lentamente rispetto<br/>a uno collocato al primo piano."]
+  W["Attenzione: non è un difetto di misura<br/>dell'orologio, è il tempo stesso a<br/>scorrere in modo diverso."]
+  T --> D --> M --> E --> W
+  classDef title fill:#DCEBFA,stroke:#6E9BD1,stroke-width:2px,color:#1F2937
+  classDef definition fill:#E3F4E8,stroke:#79B791,color:#1F2937
+  classDef mechanism fill:#FFF3D6,stroke:#D6AE55,color:#1F2937
+  classDef example fill:#F1E6FA,stroke:#A98BCB,color:#1F2937
+  classDef warning fill:#FBE1E1,stroke:#D98A8A,color:#1F2937
+  class T title
+  class D definition
+  class M mechanism
+  class E example
+  class W warning"""
+
+CARD_USER = "Concept to explain: {concept}\n\nNotes:\n\n{notes}"
+
+
+DIAGRAM_LABEL_FIX = """Only {labeled} of the {total} arrows in your diagram carry a label, so the \
+diagram does not explain anything: an unlabelled arrow between two topics carries no information.
+
+Revise it so that essentially every arrow has a short label (1-3 words) and passes the sentence \
+test: reading "<source node> <label> <target node>" out loud must produce a meaningful sentence. \
+Keep the same concepts; add the missing labels, and rephrase the nodes where that is needed to \
+make the sentences work.
+
+Return the COMPLETE corrected Mermaid code only, starting with "flowchart TD"."""

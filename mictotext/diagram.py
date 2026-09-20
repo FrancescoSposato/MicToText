@@ -188,6 +188,21 @@ def _render_with_layout_fallback(code: str, mmd_path: Path, html_path: Path,
     return renderer.render(mmd_path, image_path)
 
 
+def plan_diagrams(notes_md: str, llm_cfg: LlmConfig) -> tuple[str, list[tuple[str, str]]]:
+    """Decide what the main diagram covers, and which topics get their own.
+
+    Returns (source for the main diagram, topics to detail). For short notes the main
+    diagram is built from everything and there are no topic diagrams, exactly as before.
+    """
+    if len(notes_md) <= llm_cfg.split_topics_over_chars:
+        return notes_md, []
+    topics = split_notes_by_topic(notes_md)
+    if len(topics) < 2:
+        return notes_md, []
+    topics = topics[:llm_cfg.max_topic_diagrams]
+    return notes_outline(notes_md, topics), topics
+
+
 def generate_diagram(notes_md: str, client: OllamaClient, model: str, llm_cfg: LlmConfig,
                      render_cfg: RenderConfig, renderer, output_dir: Path, language: str) -> DiagramResult:
     mmd_path = output_dir / "schema.mmd"
@@ -195,7 +210,9 @@ def generate_diagram(notes_md: str, client: OllamaClient, model: str, llm_cfg: L
     image_path = output_dir / f"schema.{render_cfg.image_format}"
 
     messages = [
-        {"role": "system", "content": prompts.DIAGRAM_SYSTEM.format(language=language)},
+        {"role": "system", "content": prompts.with_topic(
+            prompts.DIAGRAM_SYSTEM.format(language=language),
+            llm_cfg.topic, llm_cfg.subtopics)},
         {"role": "user", "content": prompts.DIAGRAM_USER.format(notes=notes_md)},
     ]
     code = _ask_for_code(client, model, messages, llm_cfg.diagram_temperature)
@@ -283,8 +300,9 @@ def extract_concepts(notes_md: str, client: OllamaClient, model: str, llm_cfg: L
                      language: str, max_concepts: int) -> list[str]:
     """Ask the model which concepts deserve their own explanation card."""
     messages = [
-        {"role": "system", "content": prompts.CONCEPTS_SYSTEM.format(
-            language=language, max_concepts=max_concepts)},
+        {"role": "system", "content": prompts.with_topic(
+            prompts.CONCEPTS_SYSTEM.format(language=language, max_concepts=max_concepts),
+            llm_cfg.topic, llm_cfg.subtopics)},
         {"role": "user", "content": prompts.CONCEPTS_USER.format(notes=notes_md)},
     ]
     raw = client.chat(model, messages, llm_cfg.diagram_temperature)
@@ -319,8 +337,9 @@ def generate_concept_cards(notes_md: str, concepts: list[str], client: OllamaCli
         stem = f"{index:02d}-{_slug(concept)}"
         print(f"\n  --- Scheda {index}/{len(concepts)}: {concept} ---")
         messages = [
-            {"role": "system", "content": prompts.CARD_SYSTEM.format(
-                concept=concept, language=language)},
+            {"role": "system", "content": prompts.with_topic(
+                prompts.CARD_SYSTEM.format(concept=concept, language=language),
+                llm_cfg.topic, llm_cfg.subtopics)},
             {"role": "user", "content": prompts.CARD_USER.format(concept=concept, notes=notes_md)},
         ]
         try:
@@ -345,3 +364,192 @@ def generate_concept_cards(notes_md: str, concepts: list[str], client: OllamaCli
             _write_sources(code, mmd_path, html_path, render_cfg, with_html=True)
 
     return produced
+
+
+# --- Splitting long notes into one diagram per topic ---------------------------------
+
+_HEADING_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+_MIN_TOPIC_CHARS = 120  # below this a section has nothing worth diagramming
+
+
+def split_notes_by_topic(notes_md: str) -> list[tuple[str, str]]:
+    """Split notes at '## ' headings into (title, markdown) pairs.
+
+    The notes already carry the author's own topic structure, so there is no need to ask
+    a model where to cut. Scaffolding sections are skipped: they are not topics.
+    """
+    matches = list(_HEADING_RE.finditer(notes_md))
+    topics: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        title = match.group(1).strip()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(notes_md)
+        body = notes_md[match.start():end].strip()
+        if _is_scaffolding(title) or len(body) < _MIN_TOPIC_CHARS:
+            continue
+        topics.append((title, body))
+    return topics
+
+
+def notes_outline(notes_md: str, topics: list[tuple[str, str]]) -> str:
+    """A condensed view of the notes: the title plus each topic's first bullets.
+
+    Feeding the overview diagram the whole document would just reproduce the problem it
+    exists to solve, so it only sees the skeleton.
+    """
+    first_line = notes_md.strip().splitlines()[0] if notes_md.strip() else ""
+    parts = [first_line if first_line.startswith("# ") else "# Contenuto"]
+    for title, body in topics:
+        parts.append(f"\n## {title}")
+        bullets = [ln.strip() for ln in body.splitlines() if ln.strip().startswith(("-", "*"))]
+        parts.extend(f"  {b}" for b in bullets[:2])
+    return "\n".join(parts)
+
+
+def generate_topic_diagrams(topics: list[tuple[str, str]], client: OllamaClient, model: str,
+                            llm_cfg: LlmConfig, render_cfg: RenderConfig, renderer,
+                            output_dir: Path, language: str) -> list[Path]:
+    """One logical diagram per topic. A failing topic is skipped, not fatal."""
+    topics_dir = output_dir / "schemi"
+    topics_dir.mkdir(parents=True, exist_ok=True)
+    produced: list[Path] = []
+
+    for index, (title, body) in enumerate(topics, start=1):
+        stem = f"{index:02d}-{_slug(title)}"
+        print(f"\n  --- Schema {index}/{len(topics)}: {title} ---")
+        messages = [
+            {"role": "system", "content": prompts.with_topic(
+            prompts.DIAGRAM_SYSTEM.format(language=language),
+            llm_cfg.topic, llm_cfg.subtopics)},
+            {"role": "user", "content": prompts.DIAGRAM_USER.format(notes=body)},
+        ]
+        try:
+            code = _ask_for_code(client, model, messages, llm_cfg.diagram_temperature)
+        except (DiagramError, OllamaError) as exc:
+            print(f"  Schema saltato ({exc}).")
+            continue
+
+        mmd_path = topics_dir / f"{stem}.mmd"
+        html_path = topics_dir / f"{stem}.html"
+        image_path = topics_dir / f"{stem}.{render_cfg.image_format}"
+        if renderer is None:
+            _write_sources(code, mmd_path, html_path, render_cfg, with_html=True)
+            continue
+
+        ok, output = _render_with_layout_fallback(code, mmd_path, html_path, render_cfg,
+                                                  renderer, image_path)
+        if ok:
+            produced.append(image_path)
+        else:
+            print(f"  Render fallito: {output.splitlines()[-1][:120] if output else '?'}")
+            _write_sources(code, mmd_path, html_path, render_cfg, with_html=True)
+
+    return produced
+
+
+# --- Targeted revision of a single diagram or card -----------------------------------
+
+_FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
+_EMPTY_FEEDBACK = "(nessuna indicazione)"
+
+
+def _strip_header(full_code: str) -> str:
+    return _FRONTMATTER_RE.sub("", full_code).strip()
+
+
+_STOPWORDS = {"della", "delle", "degli", "dello", "questo", "questa", "queste", "questi",
+              "conservare", "conservata", "conservati", "mantenere", "mantenuta", "distinzione",
+              "parte", "punto", "sezione", "schema", "diagramma", "nodo", "nodi", "vanno",
+              "essere", "sono", "come", "anche", "molto", "tutto", "tutti", "tutte"}
+
+
+def _kept_terms(correct_text: str, previous_code: str) -> list[str]:
+    """Words the user asked to keep that were actually in the previous diagram.
+
+    Only those can be checked: a term that was never there cannot have been dropped.
+    """
+    words = {w.lower() for w in re.findall(r"[^\W\d_]{5,}", correct_text, re.UNICODE)}
+    lowered = previous_code.lower()
+    return sorted(w for w in words - _STOPWORDS if w in lowered)
+
+
+def _dropped_terms(terms: list[str], new_code: str) -> list[str]:
+    lowered = new_code.lower()
+    return [t for t in terms if t not in lowered]
+
+
+def regenerate_from_feedback(mmd_path: Path, image_path: Path, notes_md: str, feedback: dict,
+                             kind: str, client: OllamaClient, model: str, llm_cfg: LlmConfig,
+                             render_cfg: RenderConfig, renderer, language: str,
+                             concept: str = "") -> tuple[bool, str]:
+    """Revise one existing diagram according to user feedback, in place.
+
+    `kind` picks which set of rules applies: "card" for the discursive cards, anything
+    else for the relational diagrams. The previous code is replayed as the assistant's
+    turn so the model revises it rather than starting over.
+    """
+    if not mmd_path.exists():
+        return False, "Il file di origine non esiste piu'."
+
+    previous = _strip_header(mmd_path.read_text(encoding="utf-8"))
+    if kind == "card":
+        system = prompts.with_topic(
+            prompts.CARD_SYSTEM.format(concept=concept or "il concetto", language=language),
+            llm_cfg.topic, llm_cfg.subtopics)
+        first_user = prompts.CARD_USER.format(concept=concept or "", notes=notes_md)
+    else:
+        system = prompts.with_topic(prompts.DIAGRAM_SYSTEM.format(language=language),
+                                    llm_cfg.topic, llm_cfg.subtopics)
+        first_user = prompts.DIAGRAM_USER.format(notes=notes_md)
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": first_user},
+        {"role": "assistant", "content": previous},
+        {"role": "user", "content": prompts.REVISE_USER.format(
+            what_is_wrong=feedback.get("what_is_wrong") or _EMPTY_FEEDBACK,
+            missing=feedback.get("missing") or _EMPTY_FEEDBACK,
+            correct=feedback.get("correct") or _EMPTY_FEEDBACK,
+            options=feedback.get("options") or _EMPTY_FEEDBACK,
+        )},
+    ]
+
+    try:
+        code = _ask_for_code(client, model, messages, llm_cfg.diagram_temperature)
+    except (DiagramError, OllamaError) as exc:
+        return False, str(exc)
+
+    # Models reliably honour "what is wrong" but quietly drop items from "keep these",
+    # especially when another part of the feedback asks to shrink the diagram. Checking
+    # is cheap; trusting is not.
+    warning = ""
+    protected = _kept_terms(feedback.get("correct") or "", previous)
+    dropped = _dropped_terms(protected, code)
+    if dropped:
+        print(f"  Elementi da conservare spariti ({', '.join(dropped)}): richiedo una correzione...")
+        messages.append({"role": "user", "content": prompts.REVISE_KEEP_FIX.format(
+            dropped=", ".join(dropped))})
+        try:
+            retry = _ask_for_code(client, model, messages, llm_cfg.diagram_temperature)
+            still = _dropped_terms(protected, retry)
+            if len(still) < len(dropped):
+                code, dropped = retry, still
+        except (DiagramError, OllamaError):
+            pass
+        if dropped:
+            warning = (f" Attenzione: non ha conservato {', '.join(dropped)} nonostante la "
+                       f"richiesta.")
+
+    html_path = mmd_path.with_suffix(".html")
+    if renderer is None:
+        _write_sources(code, mmd_path, html_path, render_cfg, with_html=True)
+        return True, "Rigenerato (nessun renderer: solo HTML)."
+
+    backup = mmd_path.read_text(encoding="utf-8")
+    ok, output = _render_with_layout_fallback(code, mmd_path, html_path, render_cfg,
+                                              renderer, image_path)
+    if ok:
+        return True, "Rigenerato." + warning
+
+    # Keep the working version rather than leaving a broken one behind.
+    mmd_path.write_text(backup, encoding="utf-8")
+    return False, f"La revisione non si renderizza, versione precedente mantenuta. {output[-200:]}"

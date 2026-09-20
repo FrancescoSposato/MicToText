@@ -47,7 +47,8 @@ def generate_notes(transcript: str, client: OllamaClient, model: str, cfg: LlmCo
 
     if len(chunks) == 1:
         messages = [
-            {"role": "system", "content": prompts.NOTES_SYSTEM.format(language=language)},
+            {"role": "system", "content": prompts.with_topic(
+                prompts.NOTES_SYSTEM.format(language=language), cfg.topic, cfg.subtopics)},
             {"role": "user", "content": prompts.NOTES_USER.format(transcript=text)},
         ]
         return _clean(client.chat(model, messages, cfg.notes_temperature, think=cfg.think_notes))
@@ -57,8 +58,10 @@ def generate_notes(transcript: str, client: OllamaClient, model: str, cfg: LlmCo
     for index, chunk in enumerate(chunks, start=1):
         print(f"\n  --- Part {index}/{len(chunks)} ---")
         messages = [
-            {"role": "system", "content": prompts.NOTES_CHUNK_SYSTEM.format(
-                language=language, index=index, total=len(chunks))},
+            {"role": "system", "content": prompts.with_topic(
+                prompts.NOTES_CHUNK_SYSTEM.format(language=language, index=index,
+                                                  total=len(chunks)),
+                cfg.topic, cfg.subtopics)},
             {"role": "user", "content": prompts.NOTES_USER.format(transcript=chunk)},
         ]
         partial_notes.append(_clean(client.chat(model, messages, cfg.notes_temperature,
@@ -67,7 +70,8 @@ def generate_notes(transcript: str, client: OllamaClient, model: str, cfg: LlmCo
     print("\n  --- Merging parts ---")
     joined = "\n\n".join(f"<!-- part {i} -->\n{notes}" for i, notes in enumerate(partial_notes, start=1))
     messages = [
-        {"role": "system", "content": prompts.NOTES_MERGE_SYSTEM.format(language=language)},
+        {"role": "system", "content": prompts.with_topic(
+            prompts.NOTES_MERGE_SYSTEM.format(language=language), cfg.topic, cfg.subtopics)},
         {"role": "user", "content": prompts.NOTES_MERGE_USER.format(parts=joined)},
     ]
     return _clean(client.chat(model, messages, cfg.notes_temperature, think=cfg.think_notes))

@@ -51,12 +51,15 @@ class SttConfig:
     beam_size: int = 5
     vad_filter: bool = True
     download_root: str | None = None  # None = Hugging Face cache
+    # Sections to transcribe, as [(start, end), ...] in seconds. Empty = whole file.
+    # Note: faster-whisper silently disables the VAD filter when clips are used.
+    clip_ranges: list = field(default_factory=list)
 
 
 @dataclass
 class LlmConfig:
     base_url: str = "http://127.0.0.1:11434"
-    notes_model: str = "dolphin3:8b"
+    notes_model: str = "qwen3.5:9b"
     diagram_model: str | None = None  # None = same as notes_model
     num_ctx: int = 16384
     notes_temperature: float = 0.3
@@ -74,7 +77,26 @@ class LlmConfig:
     request_timeout: int = 600  # seconds between streamed chunks
     chunk_chars: int = 12000  # longer transcripts are processed in parts
     concept_cards: int = 4  # discursive cards to generate after the main diagram (0 = off)
+    # Long notes cannot fit one readable diagram, so above this size the main diagram
+    # becomes a map of the topics and each topic gets its own detailed diagram.
+    split_topics_over_chars: int = 2500
+    max_topic_diagrams: int = 12
     min_labeled_edge_ratio: float = 0.5  # below this, the main diagram is sent back for revision
+    # Subject hints, prepended to the generation prompts so the model knows the domain.
+    # `subtopics` is also stored in the transcript for a future semantic filter.
+    topic: str = ""
+    subtopics: str = ""
+
+
+@dataclass
+class FilterConfig:
+    """Automatic removal of pauses and low-confidence speech."""
+
+    enabled: bool = False
+    mode: str = "review"  # review = propose and confirm | auto = apply straight away
+    gap_seconds: float = 20.0
+    min_logprob: float = -0.8
+    max_no_speech: float = 0.6
 
 
 @dataclass
@@ -98,3 +120,4 @@ class AppConfig:
     stt: SttConfig = field(default_factory=SttConfig)
     llm: LlmConfig = field(default_factory=LlmConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
+    filter: FilterConfig = field(default_factory=FilterConfig)

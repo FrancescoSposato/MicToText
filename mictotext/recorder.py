@@ -81,6 +81,9 @@ class MicRecorder:
         self._current_rms = 0.0
         self._overflow_count = 0
         self._start_time = 0.0
+        self._paused = False
+        self._paused_at = 0.0
+        self._paused_total = 0.0  # excluded from `elapsed`, so the timer tracks real audio
 
     def start(self) -> None:
         info = sd.query_devices(self.device, "input")
@@ -127,8 +130,33 @@ class MicRecorder:
             self._write_block(block)
 
     @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def pause(self) -> bool:
+        """Stop capturing without closing the file, so recording can resume into it."""
+        if self._paused or self._stream is None:
+            return False
+        self._stream.stop()
+        self._paused = True
+        self._paused_at = time.monotonic()
+        self._current_rms = 0.0
+        return True
+
+    def resume(self) -> bool:
+        """Resume capturing, appending to the same file."""
+        if not self._paused or self._stream is None:
+            return False
+        self._paused_total += time.monotonic() - self._paused_at
+        self._stream.start()
+        self._paused = False
+        return True
+
+    @property
     def elapsed(self) -> float:
-        return time.monotonic() - self._start_time
+        if self._paused:
+            return self._paused_at - self._start_time - self._paused_total
+        return time.monotonic() - self._start_time - self._paused_total
 
     @property
     def level_db(self) -> float:

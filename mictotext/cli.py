@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 
 from mictotext.config import THINKING_LEVELS, AppConfig, language_name
+from mictotext.media import (clean_path, describe_ranges, format_time, parse_range_specs,
+                             probe_media, ranges_duration, resolve_ranges)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -17,11 +19,15 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mictotext",
         description="Local pipeline: microphone -> transcript -> Markdown notes -> Mermaid diagram.",
     )
+    # Mutually exclusive: previously a plain group, so `--url X --audio Y` silently
+    # ignored the URL instead of reporting the conflict.
     source = parser.add_argument_group("input shortcuts (skip earlier steps)")
-    source.add_argument("--url", help="download audio from a video URL (YouTube and many others)")
-    source.add_argument("--audio", type=Path, help="use an existing audio file instead of recording")
-    source.add_argument("--transcript", type=Path, help="use an existing .txt transcript (skips recording and STT)")
-    source.add_argument("--notes", type=Path, help="use an existing Markdown file (only generates the diagram)")
+    sources = source.add_mutually_exclusive_group()
+    sources.add_argument("--url", help="download audio from a video URL (YouTube and many others)")
+    sources.add_argument("--audio", help="use a local audio OR video file instead of recording "
+                                         "(quoted Windows paths are accepted)")
+    sources.add_argument("--transcript", type=Path, help="use an existing .txt transcript (skips recording and STT)")
+    sources.add_argument("--notes", type=Path, help="use an existing Markdown file (only generates the diagram)")
 
     audio = parser.add_argument_group("audio")
     audio.add_argument("--list-devices", action="store_true", help="list input devices and exit")
@@ -32,6 +38,20 @@ def build_parser() -> argparse.ArgumentParser:
     stt.add_argument("--stt-device", choices=["auto", "cuda", "cpu"], default="auto")
     stt.add_argument("--whisper-model", help="Whisper model used on GPU (default: large-v3-turbo)")
     stt.add_argument("--whisper-cpu-model", help="Whisper model used on CPU (default: small)")
+    ctx = parser.add_argument_group("contesto e filtro")
+    ctx.add_argument("--topic", help="subject of the recording; steers notes and diagrams")
+    ctx.add_argument("--subtopics", help="comma-separated subtopics to focus on")
+    ctx.add_argument("--filter-pauses", action="store_true",
+                     help="drop pauses and low-confidence speech (applied straight away; "
+                          "the web UI can propose them for confirmation instead)")
+    ctx.add_argument("--gap-seconds", type=float, help="silence that starts a new block (default: 20)")
+    ctx.add_argument("--min-logprob", type=float, help="below this a block is suspect (default: -0.8)")
+    ctx.add_argument("--max-no-speech", type=float, help="above this a block is suspect (default: 0.6)")
+
+    stt.add_argument("--keep", action="append", metavar="DA-A",
+                     help="transcribe only this section; repeatable. Times as 90, 1:30 or "
+                          "01:02:03, e.g. --keep 2:00-15:30 --keep 40:00-55:00. "
+                          "Applies to every source. Disables Whisper's VAD filter.")
 
     llm = parser.add_argument_group("LLM (Ollama)")
     llm.add_argument("--llm-model", help="Ollama model for notes (default: qwen2.5:7b)")
@@ -65,6 +85,19 @@ def _parse_device(value: str | None) -> int | str | None:
 def build_config(args: argparse.Namespace) -> AppConfig:
     cfg = AppConfig()
     cfg.audio.device = _parse_device(args.input_device)
+
+    # Syntax only: the real duration is unknown until the media exists, but a typo must
+    # fail now rather than after a recording has already been made.
+    cfg.stt.clip_ranges = parse_range_specs(args.keep)
+
+    cfg.llm.topic = (args.topic or "").strip()
+    cfg.llm.subtopics = (args.subtopics or "").strip()
+    cfg.filter.enabled = bool(args.filter_pauses)
+    cfg.filter.mode = "auto"  # the terminal has no review step
+    for name in ("gap_seconds", "min_logprob", "max_no_speech"):
+        value = getattr(args, name)
+        if value is not None:
+            setattr(cfg.filter, name, value)
 
     cfg.stt.language = None if args.language.lower() == "auto" else args.language
     cfg.stt.device = args.stt_device
@@ -148,7 +181,16 @@ def run(args: argparse.Namespace, cfg: AppConfig) -> int:
             if args.transcript:
                 transcript_text = args.transcript.read_text(encoding="utf-8")
             else:
-                audio_path = args.audio.resolve() if args.audio else None
+                audio_path = clean_path(args.audio) if args.audio else None
+                if audio_path is not None:
+                    # Fail on a bad path here, with a readable message, rather than deep
+                    # inside the child process on an opaque decoder error.
+                    info = probe_media(audio_path)
+                    if not info.ok:
+                        print(f"ERROR: {info.error}")
+                        return 2
+                    kind = "video" if info.has_video else "audio"
+                    print(f"  {audio_path.name} — {format_time(info.duration or 0)}, {kind}")
                 if audio_path is None and args.url:
                     from mictotext.fetch import download_audio
                     _step("1/4 Download")
@@ -163,15 +205,51 @@ def run(args: argparse.Namespace, cfg: AppConfig) -> int:
                     duration = record_until_enter(audio_path, cfg.audio.device, cfg.audio.channels)
                     print(f"  Saved {duration:.1f}s of audio to {audio_path.name}")
 
+                # Second phase: now the media exists, so the sections can be checked
+                # against its real duration and clamped or merged.
+                if cfg.stt.clip_ranges:
+                    probed = probe_media(audio_path)
+                    try:
+                        cfg.stt.clip_ranges, warnings = resolve_ranges(cfg.stt.clip_ranges,
+                                                                       probed.duration)
+                    except ValueError as exc:
+                        print(f"ERROR: {exc}")
+                        if audio_path.is_relative_to(session_dir):
+                            print(f"L'audio registrato resta in {audio_path}")
+                        return 2
+                    for warning in warnings:
+                        print(f"  {warning}")
+                    print(f"  Sezioni: {describe_ranges(cfg.stt.clip_ranges)} "
+                          f"({format_time(ranges_duration(cfg.stt.clip_ranges))} su "
+                          f"{format_time(probed.duration or 0)})")
+
                 from mictotext.transcriber import transcribe
                 _step("2/4 Transcription")
                 started = time.perf_counter()
                 transcript = transcribe(audio_path, session_dir, cfg.stt)
                 timings["transcription"] = time.perf_counter() - started
                 transcript_text = transcript.text
+                if cfg.filter.enabled:
+                    from mictotext.segments import (apply_selection, auto_selection,
+                                                    describe, split_into_blocks)
+                    blocks = split_into_blocks(transcript.segments, cfg.filter.gap_seconds,
+                                               cfg.filter.min_logprob, cfg.filter.max_no_speech)
+                    keep = auto_selection(blocks)
+                    if not keep:
+                        print("  Il filtro scarterebbe tutto: lo ignoro e tengo la trascrizione intera.")
+                    else:
+                        for line in describe(blocks, keep):
+                            print(f"  {line}")
+                        _, filtered = apply_selection(blocks, keep)
+                        print(f"  Filtro: {len(keep)}/{len(blocks)} blocchi tenuti, "
+                              f"{len(transcript_text.split())} -> {len(filtered.split())} parole.")
+                        transcript_text = filtered
                 output_language = output_language or transcript.language
+                scope = (f"{transcript.clipped_duration:.0f}s selezionati su "
+                         f"{transcript.duration:.0f}s" if transcript.clip_ranges
+                         else f"{transcript.duration:.0f}s audio")
                 print(f"  Done on {transcript.device} with '{transcript.model}' "
-                      f"({transcript.duration:.0f}s audio in {transcript.elapsed:.1f}s)")
+                      f"({scope} in {transcript.elapsed:.1f}s)")
 
             if not transcript_text.strip():
                 print("ERROR: empty transcript (no speech detected).")
@@ -186,8 +264,16 @@ def run(args: argparse.Namespace, cfg: AppConfig) -> int:
 
         _step("4/4 Mermaid diagram")
         started = time.perf_counter()
-        result = generate_diagram(notes_md, client, diagram_model, cfg.llm, cfg.render, renderer,
+        from mictotext.diagram import generate_topic_diagrams, plan_diagrams
+        main_source, topics = plan_diagrams(notes_md, cfg.llm)
+        if topics:
+            print(f"  Appunti lunghi: lo schema principale mappa {len(topics)} argomenti, "
+                  f"ognuno con il proprio schema di dettaglio.")
+        result = generate_diagram(main_source, client, diagram_model, cfg.llm, cfg.render, renderer,
                                   session_dir, language_name(output_language))
+        if topics:
+            generate_topic_diagrams(topics, client, diagram_model, cfg.llm, cfg.render, renderer,
+                                    session_dir, language_name(output_language))
         timings["diagram"] = time.perf_counter() - started
 
         if cfg.llm.concept_cards > 0:
@@ -238,7 +324,14 @@ def main(argv: list[str] | None = None) -> int:
         print(list_input_devices())
         return 0
     try:
-        return run(args, build_config(args))
+        cfg = build_config(args)
+    except ValueError as exc:  # malformed --keep: fail before recording or preflight
+        print(f"ERROR: {exc}")
+        return 2
+    if args.keep and (args.transcript or args.notes):
+        print("Attenzione: --keep non ha effetto con --transcript o --notes.")
+    try:
+        return run(args, cfg)
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         return 130

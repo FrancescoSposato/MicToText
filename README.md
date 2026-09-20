@@ -54,6 +54,59 @@ Vedi `--help` per tutte le opzioni:
 python -m mictotext --help
 ```
 
+## Sorgenti e sezioni
+
+Oltre al microfono, MicToText accetta un **URL di un video** (`--url`, scarica solo l'audio) e un
+**file locale**, audio o video (`--audio`, oppure il campo apposito nell'interfaccia web). Il file
+locale viene letto dov'è: nessuna copia, nessuna estrazione dell'audio.
+
+Con `--keep` si trascrive **solo una parte** della registrazione, utile sulle lezioni lunghe:
+
+```powershell
+python -m mictotext --audio "C:\...\lezione.mp4" --keep 2:00-15:30 --keep 40:00-55:00
+```
+
+Il flag è ripetibile e accetta i formati `90`, `1:30` e `01:02:03`. Nell'interfaccia web la stessa
+cosa si fa dalle *Impostazioni*, e vale per tutte le sorgenti.
+
+Due avvertenze, entrambe segnalate anche dall'app quando usi le sezioni:
+
+- **Il filtro VAD di Whisper viene disattivato.** È un limite di faster-whisper: il VAD funziona
+  solo quando non ci sono sezioni. I silenzi lunghi dentro le sezioni scelte vengono quindi
+  elaborati, e Whisper può ripetersi.
+- **Il file viene comunque letto e decodificato per intero.** Le sezioni riducono il tempo di
+  trascrizione, non quello di lettura del file.
+
+Poiché il file non viene copiato, la cartella di sessione non è autosufficiente: per questo
+`trascrizione.json` registra il percorso della sorgente e le sezioni usate.
+
+## Controllo avanzato
+
+Nell'interfaccia web, in fondo alla pagina, il pannello **Controllo avanzato** raccoglie una
+ventina di parametri con cursori, menu e interruttori, ciascuno con una riga che spiega cosa
+succede alzando o abbassando. I valori restano memorizzati nel browser, così si può cambiare una
+manopola per volta senza ridigitare le altre; il pulsante *Ripristina valori predefiniti* azzera.
+
+**Argomento e sottoargomenti** vengono anteposti ai prompt: il modello sa di cosa si parla, usa la
+terminologia giusta e considera fuori tema il resto.
+
+**Filtro pause e rumore** usa i segnali che Whisper calcola per ogni segmento (`logprob`,
+`no_speech`, distanza dal segmento precedente), ora conservati in `trascrizione.json`. Due modalità:
+
+- *Proponi e conferma* (predefinita): la pipeline si ferma, mostra i blocchi di parlato con durata
+  e prime parole, e riparte solo dopo la tua scelta. I blocchi dubbi sono evidenziati.
+- *Applica subito*: scarta da sé e prosegue. È l'unica modalità da riga di comando
+  (`--filter-pauses`), dove non ha senso una conferma interattiva.
+
+Le soglie predefinite sono volutamente permissive (pausa ≥ 20 s, `logprob` ≥ −0.8, `no_speech`
+≤ 0.6): tarate su una lezione reale, dove il parlato pulito misura fra −0.03 e −0.06. Perdere un
+pezzo di lezione senza accorgersene è molto peggio che tenere un po' di rumore.
+
+```powershell
+python -m mictotext --audio "lezione.mp4" --topic "sistemi operativi" `
+  --subtopics "kernel, memoria, permessi" --filter-pauses
+```
+
 ## Interfaccia web (opzionale)
 
 Oltre al flusso da riga di comando, c'è una piccola interfaccia grafica che

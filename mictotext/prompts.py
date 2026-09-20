@@ -278,3 +278,70 @@ Keep the same concepts; add the missing labels, and rephrase the nodes where tha
 make the sentences work.
 
 Return the COMPLETE corrected Mermaid code only, starting with "flowchart TD"."""
+
+
+# --- Targeted revision of one diagram or card ---------------------------------------
+
+REVISE_USER = """Questa e' la versione precedente del diagramma, che va rivista secondo il \
+riscontro qui sotto.
+
+RISCONTRO DELL'UTENTE
+
+Cosa non va bene:
+{what_is_wrong}
+
+Argomenti mancanti (da aggiungere, ma solo se sono realmente presenti negli appunti):
+{missing}
+
+Argomenti corretti (da conservare cosi' come sono):
+{correct}
+
+Indicazioni per migliorare la generazione:
+{options}
+
+ISTRUZIONI, in ordine di priorita'
+1. VINCOLO NON NEGOZIABILE: tutto quanto elencato come "argomenti corretti" deve comparire \
+anche nella nuova versione, con lo stesso significato. Se un'altra richiesta (per esempio \
+ridurre il numero di nodi) fosse in conflitto con questo, sacrifica l'altra richiesta, non \
+questa: togli piuttosto altri elementi. Prima di rispondere, rileggi la tua versione e verifica \
+di non averne perso nessuno.
+2. Applica il resto del riscontro rispettando tutte le regole di sintassi e di stile ricevute.
+3. Non aggiungere nulla che non sia sostenuto dagli appunti, nemmeno se il riscontro lo chiede: \
+se un argomento indicato come mancante non e' negli appunti, ignoralo.
+4. Campi lasciati vuoti significano "nessuna indicazione": non inventarti requisiti.
+5. Non riscrivere da zero cio' che gia' funziona.
+
+Restituisci SOLO il codice Mermaid completo e corretto."""
+
+
+REVISE_KEEP_FIX = """Nella tua nuova versione mancano elementi che ti avevo chiesto \
+esplicitamente di conservare: {dropped}.
+
+Rimettili, mantenendo il resto delle modifiche che hai appena fatto. Se serve spazio, togli \
+altri elementi meno importanti: questi erano indicati come corretti e hanno la precedenza.
+
+Restituisci SOLO il codice Mermaid completo."""
+
+
+# --- Subject context ----------------------------------------------------------------
+
+_TOPIC_PREFIX = """CONTESTO: la registrazione tratta di {topic}.{subtopics_line}
+Usa la terminologia di questo ambito quando una parola e' ambigua, e considera fuori tema
+(quindi da ignorare) le parti che non vi appartengono: chiacchiere, pause, digressioni.
+
+"""
+
+
+def with_topic(system_prompt: str, topic: str = "", subtopics: str = "") -> str:
+    """Prepend the subject context to a system prompt.
+
+    Prepending instead of adding a {topic} placeholder to every constant: the prompts are
+    .format()-ed from 18 call sites, and a new placeholder would have to be threaded
+    through all of them, raising KeyError wherever one was missed.
+    """
+    topic = (topic or "").strip()
+    if not topic:
+        return system_prompt
+    subs = " ".join((subtopics or "").split())
+    line = f" In particolare: {subs}." if subs else ""
+    return _TOPIC_PREFIX.format(topic=topic, subtopics_line=line) + system_prompt

@@ -14,7 +14,7 @@ import multiprocessing as mp
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from mictotext.config import SttConfig
@@ -25,11 +25,15 @@ class Transcript:
     text: str
     language: str
     language_probability: float
-    duration: float
+    duration: float  # full file, even when only some sections were transcribed
     device: str
     model: str
     elapsed: float
     segments: list[dict]
+    # Defaulted so transcripts written before these fields existed still load.
+    clip_ranges: list = field(default_factory=list)
+    clipped_duration: float = 0.0  # seconds actually sent to the decoder
+    source_path: str = ""  # the media is read in place, so record where it came from
 
 
 def _format_timestamp(seconds: float) -> str:
@@ -52,24 +56,63 @@ def _worker(audio_path: str, result_path: str, device: str, model_name: str,
     model = WhisperModel(model_name, device=device, compute_type=compute_type,
                          download_root=options.get("download_root"))
 
+    # clip_timestamps and vad_filter are mutually exclusive: faster-whisper only runs the
+    # VAD when clip_timestamps is left at its default, and disables it silently otherwise.
+    # Branching makes the dead parameter impossible to pass by accident.
+    clips = options.get("clip_timestamps") or None
+    extra: dict = {}
+    if clips:
+        extra["clip_timestamps"] = clips
+        print(f"  Sezioni selezionate: {options.get('clip_label', '')}", flush=True)
+        print("  Nota: con le sezioni attive il filtro VAD di Whisper viene disattivato.",
+              flush=True)
+    else:
+        extra["vad_filter"] = options.get("vad_filter", True)
+        extra["vad_parameters"] = {"min_silence_duration_ms": 500}
+
     segments, info = model.transcribe(
         audio_path,
         language=options.get("language"),
         beam_size=options.get("beam_size", 5),
-        vad_filter=options.get("vad_filter", True),
-        vad_parameters={"min_silence_duration_ms": 500},
+        **extra,
     )
-    print(f"  Language: {info.language} (p={info.language_probability:.2f}), "
-          f"audio length: {info.duration:.1f}s", flush=True)
+    # info.duration is always the FULL file, so state both figures when clipping.
+    clip_ranges = options.get("clip_ranges") or []
+    clipped = sum(end - start for start, end in clip_ranges)
+    length = (f"{clipped:.1f}s selezionati su {info.duration:.1f}s totali"
+              if clip_ranges else f"audio length: {info.duration:.1f}s")
+    print(f"  Language: {info.language} (p={info.language_probability:.2f}), {length}", flush=True)
+
+    def _crosses_clip_boundary(gap_start: float, gap_end: float) -> bool:
+        """True when the silence between two segments is just the cut between clips.
+
+        With clip_timestamps the skipped audio shows up as a huge gap that has nothing
+        to do with a pause in the speech, so it must not be read as one.
+        """
+        return any(gap_start <= end <= gap_end for _, end in clip_ranges)
 
     collected: list[dict] = []
+    previous_end: float | None = None
     for segment in segments:  # generator: decoding happens while iterating
         text = segment.text.strip()
         if not text:
             continue
         print(f"  [{_format_timestamp(segment.start)} -> {_format_timestamp(segment.end)}] {text}",
               flush=True)
-        collected.append({"start": round(segment.start, 2), "end": round(segment.end, 2), "text": text})
+        # Gap from the last KEPT segment: empty ones are skipped above.
+        gap = 0.0 if previous_end is None else max(0.0, segment.start - previous_end)
+        if gap and _crosses_clip_boundary(previous_end, segment.start):
+            gap = 0.0
+        collected.append({
+            "start": round(segment.start, 2),
+            "end": round(segment.end, 2),
+            "text": text,
+            # Kept for pause/noise detection: cheap, already computed by Whisper.
+            "logprob": round(float(segment.avg_logprob), 3),
+            "no_speech": round(float(segment.no_speech_prob), 3),
+            "gap": round(gap, 2),
+        })
+        previous_end = segment.end
 
     transcript = Transcript(
         text=" ".join(item["text"] for item in collected),
@@ -80,6 +123,9 @@ def _worker(audio_path: str, result_path: str, device: str, model_name: str,
         model=model_name,
         elapsed=time.perf_counter() - started,
         segments=collected,
+        clip_ranges=[list(r) for r in clip_ranges],
+        clipped_duration=round(clipped or float(info.duration), 2),
+        source_path=audio_path,
     )
     Path(result_path).write_text(json.dumps(asdict(transcript), ensure_ascii=False, indent=2),
                                  encoding="utf-8")
@@ -110,11 +156,18 @@ def transcribe(audio_path: Path, output_dir: Path, cfg: SttConfig) -> Transcript
     if cfg.device in ("auto", "cpu"):
         plan.append(("cpu", cfg.cpu_model, cfg.cpu_compute_type))
 
+    from mictotext.media import describe_ranges
+
+    clip_ranges = [(float(s), float(e)) for s, e in (cfg.clip_ranges or [])]
     options = {
         "language": cfg.language,
         "beam_size": cfg.beam_size,
-        "vad_filter": cfg.vad_filter,
+        "vad_filter": cfg.vad_filter and not clip_ranges,
         "download_root": cfg.download_root,
+        # Flat [start, end, start, end, ...] in seconds, as faster-whisper expects.
+        "clip_timestamps": [t for pair in clip_ranges for t in pair],
+        "clip_ranges": clip_ranges,
+        "clip_label": describe_ranges(clip_ranges),
     }
     result_path = output_dir / "trascrizione.json"
     context = mp.get_context("spawn")

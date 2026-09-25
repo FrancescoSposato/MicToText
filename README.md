@@ -1,130 +1,343 @@
+<div align="center">
+
+<img src="micToText.png" alt="MicToText" width="120">
+
 # MicToText
 
-Pipeline locale da riga di comando: microfono → trascrizione (faster-whisper) →
-appunti strutturati in Markdown (Ollama) → schema Mermaid (Ollama) → immagine
-(mermaid-cli, con fallback HTML).
+**Dalla voce agli appunti, agli schemi. Tutto in locale.**
 
-Nessuna chiamata a servizi cloud: tutto gira sulla macchina locale, salvo il
-download iniziale dei pesi del modello Whisper e dei modelli Ollama.
+Registra una lezione, la trascrive, ne ricava appunti strutturati in Markdown
+e genera schemi e schede concetto. Nessun servizio cloud, nessun abbonamento:
+audio e testi non lasciano mai il tuo computer.
 
-## Rendering Mermaid: nativo su Windows, WSL2 come fallback
+</div>
 
-`mmdc` (mermaid-cli) è già installato nativamente su questa macchina
-(`npm install -g @mermaid-js/mermaid-cli`, con Chromium scaricato da
-Puppeteer in `%USERPROFILE%\.cache\puppeteer`). Con `--renderer auto`
-(il default) l'app usa **prima questa installazione nativa**, senza passare
-da WSL2: niente avvio della VM, niente conversione di percorsi.
+---
 
-Se in futuro il rendering nativo fallisce con l'errore
-`Failed to launch the browser process: Code: 3221225595`
-(`0xC000007B`, `STATUS_INVALID_IMAGE_FORMAT`), la causa è quasi sempre una
-build di Chromium/`chrome-headless-shell` scaricata corrotta o incompleta
-nella cache di Puppeteer (capitato una volta: mancava proprio `chrome.exe`,
-probabilmente per un intervento dell'antivirus durante l'estrazione).
-Si risolve reinstallando la build:
+## Indice
 
-```powershell
-npx --yes @puppeteer/browsers install chrome-headless-shell@150.0.7871.24 --path "$env:USERPROFILE\.cache\puppeteer"
+- [Cosa fa](#cosa-fa)
+- [Requisiti](#requisiti)
+- [Installazione](#installazione)
+- [Avvio](#avvio)
+- [Uso da riga di comando](#uso-da-riga-di-comando)
+- [Configurazione](#configurazione)
+- [Struttura del progetto](#struttura-del-progetto)
+- [Risoluzione dei problemi](#risoluzione-dei-problemi)
+- [Limiti noti](#limiti-noti)
+
+---
+
+## Cosa fa
+
+La pipeline parte da una sorgente audio e arriva a materiale di studio:
+
+```
+microfono / URL video / file locale
+        ↓  faster-whisper (GPU, con ripiego automatico su CPU)
+   trascrizione
+        ↓  LLM locale via Ollama
+   appunti strutturati in Markdown
+        ↓  LLM locale
+   schema logico + schemi per argomento + schede concetto
+        ↓  mermaid-cli
+   immagini PNG o SVG
 ```
 
-(la versione esatta richiesta la trovi nel messaggio d'errore di `mmdc`, es.
-`Could not find chrome-headless-shell (ver. X.Y.Z)`). WSL2 resta disponibile
-come fallback automatico (`--renderer wsl`) se quello nativo non è
-utilizzabile.
+**Funzionalità principali**
 
-Per l'analisi architetturale completa, le istruzioni di installazione passo
-passo e i limiti noti, vedi la documentazione di progetto consegnata insieme
-al codice (analisi dei componenti, scelte motivate, troubleshooting).
+- **Tre sorgenti**: microfono (con pausa e ripresa), URL di un video (YouTube e ~1800 altri
+  siti, scarica **solo l'audio**), file audio o video locale letto dov'è, senza copie.
+- **Sezioni**: trascrive solo gli intervalli scelti, per saltare le parti inutili di una lezione.
+- **Filtro pause e rumore**: individua silenzi lunghi e parlato incerto e propone cosa scartare.
+- **Due livelli di schemi**: uno schema relazionale che mostra le connessioni fra i concetti, e
+  schede discorsive che spiegano ogni concetto chiave (definizione, meccanismo, esempio, errore
+  tipico).
+- **Contenuti lunghi**: oltre una certa lunghezza gli appunti si dividono per argomento, e ogni
+  argomento riceve il proprio schema.
+- **Modifica mirata**: un modulo di riscontro a quattro campi rigenera un singolo schema o scheda.
+- **Controllo avanzato**: una ventina di parametri regolabili dall'interfaccia, ciascuno con la
+  spiegazione di cosa cambia alzandolo o abbassandolo.
+- **Interruzione**: un pulsante ferma qualunque fase in corso, trascrizione compresa.
 
-## Avvio rapido
+---
+
+## Requisiti
+
+### Software
+
+| Componente | Versione | Note |
+|---|---|---|
+| **Python** | **3.12** consigliato | 3.10+ funziona, ma le ruote di `ctranslate2` seguono le versioni più recenti con ritardo |
+| **[Ollama](https://ollama.com)** | qualsiasi recente | In esecuzione su `127.0.0.1:11434` |
+| **Node.js + npm** | LTS | Serve per `mermaid-cli` |
+| **mermaid-cli** | 11+ | `npm install -g @mermaid-js/mermaid-cli` |
+
+Non serve installare FFmpeg: PyAV include le librerie necessarie.
+
+### Hardware
+
+| | Minimo | Consigliato |
+|---|---|---|
+| **GPU** | nessuna (ripiego su CPU) | NVIDIA con 8 GB di VRAM |
+| **RAM** | 8 GB | 16 GB |
+| **Disco** | ~20 GB | dipendenze, modelli Ollama e Whisper, Chromium |
+
+Senza GPU NVIDIA tutto funziona, ma la trascrizione è sensibilmente più lenta.
+
+### Sistemi operativi
+
+Sviluppato e collaudato su **Windows 11**. Il codice Python è multipiattaforma e i punti
+specifici di Windows sono protetti, ma su Linux e macOS **non è stato provato**.
+L'avviatore `MicToText.exe` è solo per Windows.
+
+---
+
+## Installazione
+
+### 1. Clona il repository
+
+```bash
+git clone https://github.com/FrancescoSposato/MicToText.git
+cd MicToText
+```
+
+### 2. Crea l'ambiente virtuale e installa le dipendenze
+
+**Windows (PowerShell)**
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements-gpu.txt   # oppure requirements.txt per solo CPU
-
-ollama pull qwen2.5:7b
-
-python -m mictotext
+pip install -r requirements-gpu.txt   # con GPU NVIDIA
+# oppure
+pip install -r requirements.txt       # solo CPU
 ```
 
-Vedi `--help` per tutte le opzioni:
+**Linux / macOS**
 
-```powershell
-python -m mictotext --help
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## Sorgenti e sezioni
+> `requirements-gpu.txt` aggiunge le librerie CUDA (cuBLAS e cuDNN) necessarie a far girare
+> Whisper su GPU: circa 1 GB di download. Su GPU **RTX serie 50 (Blackwell)** serve cuBLAS 12.8
+> o successivo, già richiesto dal file.
 
-Oltre al microfono, MicToText accetta un **URL di un video** (`--url`, scarica solo l'audio) e un
-**file locale**, audio o video (`--audio`, oppure il campo apposito nell'interfaccia web). Il file
-locale viene letto dov'è: nessuna copia, nessuna estrazione dell'audio.
+### 3. Scarica un modello per Ollama
 
-Con `--keep` si trascrive **solo una parte** della registrazione, utile sulle lezioni lunghe:
-
-```powershell
-python -m mictotext --audio "C:\...\lezione.mp4" --keep 2:00-15:30 --keep 40:00-55:00
+```bash
+ollama pull qwen3.5:9b
 ```
 
-Il flag è ripetibile e accetta i formati `90`, `1:30` e `01:02:03`. Nell'interfaccia web la stessa
-cosa si fa dalle *Impostazioni*, e vale per tutte le sorgenti.
+È il modello predefinito, e quello consigliato per 8 GB di VRAM. Alternative più leggere:
+`qwen3.5:4b`, `gemma4:e4b`. Vedi [`Docs/guida-modelli.md`](Docs/guida-modelli.md) per il confronto.
 
-Due avvertenze, entrambe segnalate anche dall'app quando usi le sezioni:
+### 4. Installa mermaid-cli
 
-- **Il filtro VAD di Whisper viene disattivato.** È un limite di faster-whisper: il VAD funziona
-  solo quando non ci sono sezioni. I silenzi lunghi dentro le sezioni scelte vengono quindi
-  elaborati, e Whisper può ripetersi.
-- **Il file viene comunque letto e decodificato per intero.** Le sezioni riducono il tempo di
-  trascrizione, non quello di lettura del file.
-
-Poiché il file non viene copiato, la cartella di sessione non è autosufficiente: per questo
-`trascrizione.json` registra il percorso della sorgente e le sezioni usate.
-
-## Controllo avanzato
-
-Nell'interfaccia web, in fondo alla pagina, il pannello **Controllo avanzato** raccoglie una
-ventina di parametri con cursori, menu e interruttori, ciascuno con una riga che spiega cosa
-succede alzando o abbassando. I valori restano memorizzati nel browser, così si può cambiare una
-manopola per volta senza ridigitare le altre; il pulsante *Ripristina valori predefiniti* azzera.
-
-**Argomento e sottoargomenti** vengono anteposti ai prompt: il modello sa di cosa si parla, usa la
-terminologia giusta e considera fuori tema il resto.
-
-**Filtro pause e rumore** usa i segnali che Whisper calcola per ogni segmento (`logprob`,
-`no_speech`, distanza dal segmento precedente), ora conservati in `trascrizione.json`. Due modalità:
-
-- *Proponi e conferma* (predefinita): la pipeline si ferma, mostra i blocchi di parlato con durata
-  e prime parole, e riparte solo dopo la tua scelta. I blocchi dubbi sono evidenziati.
-- *Applica subito*: scarta da sé e prosegue. È l'unica modalità da riga di comando
-  (`--filter-pauses`), dove non ha senso una conferma interattiva.
-
-Le soglie predefinite sono volutamente permissive (pausa ≥ 20 s, `logprob` ≥ −0.8, `no_speech`
-≤ 0.6): tarate su una lezione reale, dove il parlato pulito misura fra −0.03 e −0.06. Perdere un
-pezzo di lezione senza accorgersene è molto peggio che tenere un po' di rumore.
-
-```powershell
-python -m mictotext --audio "lezione.mp4" --topic "sistemi operativi" `
-  --subtopics "kernel, memoria, permessi" --filter-pauses
+```bash
+npm install -g @mermaid-js/mermaid-cli
+mmdc --version
 ```
 
-## Interfaccia web (opzionale)
+Al primo utilizzo Puppeteer scarica un Chromium (~1,3 GB).
 
-Oltre al flusso da riga di comando, c'è una piccola interfaccia grafica che
-si apre nel browser, utile se preferisci un pulsante a `premi INVIO`:
+### 5. Verifica
 
-```powershell
+```bash
+python -m mictotext --list-devices   # elenca i microfoni
+python -m mictotext.web              # avvia l'interfaccia
+```
+
+I modelli Whisper vengono scaricati da Hugging Face al primo uso
+(`large-v3-turbo`, circa 1,6 GB).
+
+---
+
+## Avvio
+
+### Interfaccia web
+
+```bash
 python -m mictotext.web
 ```
 
-Apre automaticamente `http://127.0.0.1:8765/` (solo su questo PC, non
-esposto in rete). La pagina permette di scegliere microfono/lingua/modelli,
-avviare e fermare la registrazione con un pulsante, seguire il log
-dell'elaborazione in tempo reale e vedere appunti e schema al termine, con
-link per scaricare `appunti.md`, `schema.mmd` e `trascrizione.txt`.
+Apre da sola `http://127.0.0.1:8765/` nel browser. Il server ascolta **solo su localhost**:
+non è raggiungibile dalla rete. `Ctrl+C` per fermarlo.
 
-Il microfono resta comunque catturato dal processo Python sul PC (tramite
-`sounddevice`, come nel flusso CLI): il browser è solo il telecomando e il
-visualizzatore dei risultati, l'audio non transita mai sulla rete. È uno
-strumento per un solo utente/una sessione alla volta, non un server
-multiutente: se una registrazione o un'elaborazione sono in corso, avviarne
-un'altra viene rifiutato finché la prima non finisce.
+### Avviatore per Windows
+
+Nella cartella del progetto c'è `MicToText.Launcher.cs`, sorgente di un piccolo eseguibile che
+controlla l'ambiente, avvia Ollama se serve e apre l'app con un doppio clic. Per compilarlo:
+
+```powershell
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe `
+  /win32icon:MicToText.ico /out:MicToText.exe /r:System.Windows.Forms.dll `
+  MicToText.Launcher.cs
+```
+
+Usa il compilatore C# già presente in Windows: non serve installare nulla.
+L'eseguibile va tenuto nella cartella del progetto; per averlo sul desktop, creane un collegamento.
+
+---
+
+## Uso da riga di comando
+
+```bash
+python -m mictotext                                    # registra dal microfono
+python -m mictotext --url "https://youtube.com/..."    # da un video online
+python -m mictotext --audio "C:\...\lezione.mp4"       # da un file locale
+```
+
+**Opzioni principali**
+
+| Opzione | Effetto |
+|---|---|
+| `--keep 2:00-15:30` | Trascrive solo questo intervallo. Ripetibile |
+| `--topic "sistemi operativi"` | Argomento: guida appunti e schemi |
+| `--subtopics "kernel, memoria"` | Aspetti da privilegiare |
+| `--filter-pauses` | Scarta pause e parlato incerto |
+| `--cards N` | Numero di schede concetto (0 per nessuna) |
+| `--thinking none\|notes\|full` | Quanto ragionamento interno spendere |
+| `--llm-model qwen3.5:9b` | Modello per gli appunti |
+| `--language it` | Lingua parlata, oppure `auto` |
+
+`python -m mictotext --help` per l'elenco completo.
+
+**Output**: una cartella per sessione in `output/`, chiamata con il titolo che l'IA dà agli
+appunti più la data, ad esempio `Sistemi_Operativi_21_09_26/`. Contiene trascrizione, appunti,
+schemi e schede.
+
+---
+
+## Configurazione
+
+I valori predefiniti sono in [`mictotext/config.py`](mictotext/config.py). Quasi tutti si
+regolano anche dall'interfaccia, nel pannello **Controllo avanzato**, senza toccare il codice.
+
+| Impostazione | Predefinito | A cosa serve |
+|---|---|---|
+| `notes_model` | `qwen3.5:9b` | Modello per appunti e schemi |
+| `gpu_model` | `large-v3-turbo` | Modello Whisper su GPU |
+| `think_notes` / `think` | `True` / `False` | Ragionamento solo dove nasce il contenuto |
+| `num_ctx` | `16384` | Finestra di contesto |
+| `split_topics_over_chars` | `2500` | Oltre questa soglia gli appunti si dividono in più schemi |
+| `concept_cards` | `4` | Schede concetto per sessione |
+| `renderer` | `auto` | `mmdc` nativo, via WSL, oppure solo HTML |
+
+Il livello di ragionamento è il parametro con più impatto. Misurato sulla stessa sorgente:
+
+| Livello | Tempo | Fedeltà |
+|---|---|---|
+| `none` | 1 min 22 s | ❌ il modello tende a inventare |
+| `notes` (predefinito) | 2 min 12 s | ✅ |
+| `full` | 12 min 42 s | ✅ senza vantaggi misurabili |
+
+---
+
+## Struttura del progetto
+
+```
+MicToText/
+├── mictotext/
+│   ├── __main__.py      # python -m mictotext
+│   ├── cli.py           # riga di comando
+│   ├── web.py           # server Flask + interfaccia (HTML/CSS/JS inclusi)
+│   ├── config.py        # tutti i valori predefiniti
+│   ├── recorder.py      # cattura dal microfono
+│   ├── fetch.py         # download audio da URL (yt-dlp)
+│   ├── media.py         # analisi dei file e intervalli di tempo
+│   ├── transcriber.py   # Whisper in un processo separato
+│   ├── segments.py      # rilevamento di pause e rumore
+│   ├── notes.py         # trascrizione -> appunti
+│   ├── diagram.py       # appunti -> Mermaid, schede, rigenerazione
+│   ├── prompts.py       # tutti i prompt
+│   ├── renderer.py      # mermaid-cli (nativo o via WSL)
+│   ├── session.py       # nomi delle cartelle di sessione
+│   └── cancel.py        # interruzione delle operazioni
+├── Docs/                # guida ai modelli e ricerca
+├── output/              # una cartella per sessione (esclusa da git)
+└── requirements*.txt
+```
+
+---
+
+## Risoluzione dei problemi
+
+<details>
+<summary><b>I menu dei modelli sono vuoti</b></summary>
+
+Ollama non è raggiungibile. Avvialo (`ollama serve`) e verifica con
+`curl http://127.0.0.1:11434/api/tags`.
+</details>
+
+<details>
+<summary><b>"Missing model(s) in Ollama"</b></summary>
+
+Il modello configurato non è scaricato: `ollama pull qwen3.5:9b`, oppure scegline un altro dal
+menu dell'interfaccia.
+</details>
+
+<details>
+<summary><b>La trascrizione usa sempre la CPU</b></summary>
+
+Le librerie CUDA non vengono trovate. Installa `requirements-gpu.txt` nell'ambiente giusto e
+verifica il driver con `nvidia-smi`. In alternativa, metti le DLL di cuBLAS e cuDNN 9 nella
+cartella `cuda_libs/`: l'app la aggiunge da sé al percorso di ricerca.
+</details>
+
+<details>
+<summary><b>Gli schemi non vengono renderizzati</b></summary>
+
+Se compare `Failed to launch the browser process` con codice `3221225595`, il Chromium di
+Puppeteer è incompleto. Reinstalla la versione esatta indicata nel messaggio d'errore:
+
+```bash
+npx @puppeteer/browsers install chrome-headless-shell@<versione>
+```
+</details>
+
+<details>
+<summary><b>Errore sui criteri di esecuzione di PowerShell</b></summary>
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+</details>
+
+<details>
+<summary><b>La trascrizione rallenta fra una sessione e l'altra</b></summary>
+
+Ollama tiene il modello in VRAM per 10 minuti, e su 8 GB non resta spazio per Whisper.
+Esegui `ollama stop qwen3.5:9b` prima della sessione successiva, oppure riduci `keep_alive`
+in `config.py`.
+</details>
+
+---
+
+## Limiti noti
+
+- **I modelli possono inventare.** Con il ragionamento attivo sugli appunti il problema è molto
+  contenuto, ma **rileggi sempre gli appunti confrontandoli con `trascrizione.txt`**, che resta
+  salvato apposta.
+- **Le sezioni disattivano il filtro VAD di Whisper.** È un limite di faster-whisper: i silenzi
+  lunghi dentro le sezioni scelte vengono comunque elaborati.
+- **Le sezioni non riducono il tempo di lettura del file**, solo quello di trascrizione: l'audio
+  viene comunque decodificato per intero.
+- **Niente distinzione fra chi parla**: in una registrazione d'aula non si separa il docente dagli
+  studenti.
+- **Nessuna trascrizione in tempo reale**: l'audio si elabora dopo la registrazione.
+- **Il file locale viene letto dov'è**, quindi la cartella di sessione non è autosufficiente. Il
+  percorso della sorgente è registrato in `trascrizione.json`.
+- **Provato solo su Windows 11.**
+
+---
+
+## Documentazione
+
+- [`Docs/guida-modelli.md`](Docs/guida-modelli.md) — i modelli disponibili, punti di forza e di
+  debolezza, quale usare per ogni attività, con i tempi misurati.
+- [`Docs/ricerca-modelli-2026.md`](Docs/ricerca-modelli-2026.md) — l'analisi che ha portato alle
+  scelte tecniche.

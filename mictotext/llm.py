@@ -8,6 +8,9 @@ from collections.abc import Iterable
 
 import requests
 
+import threading
+
+from mictotext.cancel import check as check_cancelled
 from mictotext.config import LlmConfig
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -25,9 +28,12 @@ def _model_matches(requested: str, available: str) -> bool:
 
 
 class OllamaClient:
-    def __init__(self, cfg: LlmConfig) -> None:
+    def __init__(self, cfg: LlmConfig, cancel_event: threading.Event | None = None) -> None:
         self.cfg = cfg
         self.base_url = cfg.base_url.rstrip("/")
+        # Every generation (notes, diagrams, cards, revisions) goes through chat(), so
+        # checking here makes all of them cancellable at once.
+        self.cancel_event = cancel_event
 
     def list_models(self) -> list[str]:
         try:
@@ -66,6 +72,7 @@ class OllamaClient:
         if effective_think is not None:
             payload["think"] = effective_think
 
+        check_cancelled(self.cancel_event)  # do not even start a request once stopped
         parts: list[str] = []
         try:
             with requests.post(f"{self.base_url}/api/chat", json=payload, stream=True,
@@ -73,6 +80,10 @@ class OllamaClient:
                 if response.status_code != 200:
                     raise OllamaError(f"Ollama returned HTTP {response.status_code}: {response.text[:500]}")
                 for line in response.iter_lines():
+                    # Checked on every streamed line, thinking tokens included, so a stop
+                    # lands mid-generation. Leaving the `with` closes the connection, and
+                    # Ollama stops generating when its client disconnects: the GPU is freed.
+                    check_cancelled(self.cancel_event)
                     if not line:
                         continue
                     data = json.loads(line)

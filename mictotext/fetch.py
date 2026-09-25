@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
+
+from mictotext.cancel import Cancelled
+from mictotext.cancel import check as check_cancelled
 from yt_dlp.utils import DownloadError
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
@@ -54,10 +57,14 @@ def _progress_hook(status: dict) -> None:
         print(f"\r  Download: {downloaded / 1e6:.1f} MB", end="", flush=True)
 
 
-def download_audio(url: str, dest_dir: Path) -> FetchedMedia:
+def download_audio(url: str, dest_dir: Path, cancel_event=None) -> FetchedMedia:
     """Download the best audio stream of `url` into `dest_dir`. Returns the local file."""
     if not is_url(url):
         raise FetchError(f"Non sembra un URL valido: {url!r}")
+
+    def hook(status: dict) -> None:
+        check_cancelled(cancel_event)  # raising from a hook aborts the download
+        _progress_hook(status)
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     options = {
@@ -67,7 +74,7 @@ def download_audio(url: str, dest_dir: Path) -> FetchedMedia:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,          # we print our own progress line
-        "progress_hooks": [_progress_hook],
+        "progress_hooks": [hook],
         "retries": 3,
         "socket_timeout": 30,
     }
@@ -76,9 +83,15 @@ def download_audio(url: str, dest_dir: Path) -> FetchedMedia:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=True)
             path = Path(ydl.prepare_filename(info))
-    except DownloadError as exc:
-        raise FetchError(_friendly_error(str(exc))) from exc
     except Exception as exc:  # noqa: BLE001 - yt-dlp raises a wide range of errors
+        # yt-dlp wraps exceptions raised inside hooks in its own DownloadError, so a
+        # deliberate stop would otherwise be reported as a failed download.
+        if cancel_event is not None and cancel_event.is_set():
+            for leftover in dest_dir.glob("sorgente.*"):
+                leftover.unlink(missing_ok=True)  # partial .part files
+            raise Cancelled() from exc
+        if isinstance(exc, DownloadError):
+            raise FetchError(_friendly_error(str(exc))) from exc
         raise FetchError(f"Download non riuscito: {exc}") from exc
 
     if not path.exists():

@@ -261,6 +261,10 @@ def run(args: argparse.Namespace, cfg: AppConfig) -> int:
             notes_md = generate_notes(transcript_text, client, notes_model, cfg.llm, language_name(output_language))
             timings["notes"] = time.perf_counter() - started
             (session_dir / "appunti.md").write_text(notes_md, encoding="utf-8")
+            if not args.out_dir:
+                # An explicit --out-dir is the user's own choice of name: leave it alone.
+                from mictotext.session import rename_session
+                session_dir = rename_session(session_dir, notes_md, cfg.llm.topic)
 
         _step("4/4 Mermaid diagram")
         started = time.perf_counter()

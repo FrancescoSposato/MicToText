@@ -7,3 +7,6 @@ assets/mermaid.min.js
 
 # Stato locale di Claude Code
 .claude/scheduled_tasks.lock
+
+# Eseguibile ricostruibile da MicToText.Launcher.cs con csc.exe
+*.exe

@@ -10,7 +10,6 @@ Single active session at a time: it's a personal local tool, not a multi-user se
 from __future__ import annotations
 
 import copy
-import re
 import sys
 import threading
 import webbrowser
@@ -22,6 +21,9 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 
 from mictotext.config import THINKING_LEVELS, AppConfig, language_name
 from mictotext.diagram import generate_diagram
+from mictotext.session import is_session_name, rename_session
+from mictotext.cancel import Cancelled
+from mictotext.cancel import check as check_cancelled
 from mictotext.llm import OllamaClient, OllamaError
 from mictotext.media import (clean_path, format_time, parse_range_specs, probe_media,
                              resolve_ranges)
@@ -36,7 +38,6 @@ PORT = 8765
 _ACTIVE_STEPS = ("recording", "downloading", "transcribing", "notes", "diagram", "cards",
                  "regenerating", "review")
 REVIEW_TIMEOUT = 1800  # never block the thread for ever waiting for a confirmation
-_SESSION_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}$")
 
 _STEP_LABELS = {
     "idle": "Pronto.",
@@ -48,6 +49,7 @@ _STEP_LABELS = {
     "cards": "Generazione schede concetto...",
     "regenerating": "Rigenerazione in corso...",
     "review": "In attesa: scegli i blocchi da tenere.",
+    "cancelled": "Interrotto.",
     "done": "Completato.",
     "error": "Errore.",
 }
@@ -95,6 +97,8 @@ class PipelineState:
     blocks: list = field(default_factory=list)  # speech blocks awaiting confirmation
     kept_blocks: list = field(default_factory=list)
     review_event: threading.Event = field(default_factory=threading.Event)
+    # One event reaches every stage: Ollama streaming, the Whisper child, yt-dlp.
+    cancel_event: threading.Event = field(default_factory=threading.Event)
     recorder: MicRecorder | None = None
 
     def append(self, line: str) -> None:
@@ -237,7 +241,9 @@ def create_app(base_cfg: AppConfig) -> Flask:
                 state.review_event.clear()
                 state.step = "review"
             print(f"  {len(blocks)} blocchi rilevati: in attesa della tua conferma.")
-            if not state.review_event.wait(timeout=REVIEW_TIMEOUT):
+            woke = state.review_event.wait(timeout=REVIEW_TIMEOUT)
+            check_cancelled(state.cancel_event)  # the stop button also wakes this wait
+            if not woke:
                 print("  Nessuna conferma entro il tempo limite: tengo tutto.")
                 with state.lock:
                     state.kept_blocks = [b.index for b in blocks]
@@ -269,7 +275,7 @@ def create_app(base_cfg: AppConfig) -> Flask:
         try:
             notes_model = cfg.llm.notes_model
             diagram_model = cfg.llm.diagram_model or notes_model
-            client = OllamaClient(cfg.llm)
+            client = OllamaClient(cfg.llm, state.cancel_event)
             client.ensure_ready({notes_model, diagram_model})
 
             audio_path = source_path or (session_dir / "audio.wav")
@@ -277,7 +283,7 @@ def create_app(base_cfg: AppConfig) -> Flask:
                 from mictotext.fetch import download_audio
                 state.set_step("downloading")
                 print("=== Download ===")
-                media = download_audio(url, session_dir)
+                media = download_audio(url, session_dir, state.cancel_event)
                 audio_path = media.path
                 length = f" ({media.duration / 60:.1f} min)" if media.duration else ""
                 print(f"  {media.title}{length}")
@@ -292,7 +298,7 @@ def create_app(base_cfg: AppConfig) -> Flask:
                                                                probed.duration)
                 for warning in warnings:
                     print(f"  {warning}")
-            transcript = transcribe(audio_path, session_dir, cfg.stt)
+            transcript = transcribe(audio_path, session_dir, cfg.stt, state.cancel_event)
             transcript_text = transcript.text
             if not transcript_text.strip():
                 raise RuntimeError("Trascrizione vuota: nessun parlato rilevato.")
@@ -310,6 +316,14 @@ def create_app(base_cfg: AppConfig) -> Flask:
             print("\n=== Appunti strutturati ===")
             notes_md = generate_notes(transcript_text, client, notes_model, cfg.llm, language_name(language))
             (session_dir / "appunti.md").write_text(notes_md, encoding="utf-8")
+
+            # Renamed as soon as the title exists, so the folder is well named even if
+            # the diagrams are then cancelled or fail. Everything below writes into the
+            # new path, and the page is told the new name for its /files/ URLs.
+            session_dir = rename_session(session_dir, notes_md, cfg.llm.topic)
+            with state.lock:
+                state.session_dir = session_dir
+                state.session_id = session_dir.name
             with state.lock:
                 state.notes_md = notes_md
 
@@ -351,6 +365,11 @@ def create_app(base_cfg: AppConfig) -> Flask:
 
             state.set_step("done")
             print("\n=== Fatto ===")
+        except Cancelled:
+            # Not an error: the user asked for it. Files already written stay on disk.
+            with state.lock:
+                state.step = "cancelled"
+            print(f"\n=== Interrotto === (i file gia' prodotti restano in {session_dir.name})")
         except Exception as exc:  # noqa: BLE001 - surfaced to the browser, not fatal to the server
             with state.lock:
                 state.step = "error"
@@ -419,6 +438,7 @@ def create_app(base_cfg: AppConfig) -> Flask:
             state.blocks = []
             state.kept_blocks = []
             state.review_event.clear()
+            state.cancel_event.clear()   # a stop from the last run must not kill this one
 
         payload = request.get_json(silent=True) or {}
         try:
@@ -534,6 +554,7 @@ def create_app(base_cfg: AppConfig) -> Flask:
             state.blocks = []
             state.kept_blocks = []
             state.review_event.clear()
+            state.cancel_event.clear()   # a stop from the last run must not kill this one
 
         session_id = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         session_dir = base_cfg.output_root / session_id
@@ -550,6 +571,29 @@ def create_app(base_cfg: AppConfig) -> Flask:
             return jsonify({"error": str(exc)}), 400
         threading.Thread(target=run_pipeline, args=(cfg, session_dir, url), daemon=True).start()
         return jsonify({"session_id": session_id})
+
+    @app.post("/api/cancel")
+    def api_cancel():
+        """Stop whatever is running. Each stage reacts in its own way."""
+        with state.lock:
+            step = state.step
+            recorder = state.recorder
+            if step not in _ACTIVE_STEPS:
+                return jsonify({"error": "Nessuna operazione in corso."}), 409
+
+        if step == "recording" and recorder is not None:
+            # No pipeline thread exists yet: stop capturing and do not process it.
+            duration, _peak, _overflow = recorder.stop()
+            with state.lock:
+                state.recorder = None
+                state.step = "cancelled"
+            state.append(f"Registrazione annullata dopo {duration:.0f}s: non verra' elaborata.")
+            return jsonify({"cancelled": step})
+
+        state.cancel_event.set()
+        state.review_event.set()  # a pipeline waiting for block confirmation must wake up
+        state.append("Interruzione richiesta...")
+        return jsonify({"cancelling": step})
 
     @app.post("/api/review")
     def api_review():
@@ -617,6 +661,7 @@ def create_app(base_cfg: AppConfig) -> Flask:
             state.blocks = []
             state.kept_blocks = []
             state.review_event.clear()
+            state.cancel_event.clear()   # a stop from the last run must not kill this one
 
         session_id = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         session_dir = base_cfg.output_root / session_id
@@ -664,7 +709,7 @@ def create_app(base_cfg: AppConfig) -> Flask:
             try:
                 from mictotext.diagram import regenerate_from_feedback
                 model = cfg.llm.diagram_model or cfg.llm.notes_model
-                client = OllamaClient(cfg.llm)
+                client = OllamaClient(cfg.llm, state.cancel_event)
                 print(f"=== Rigenerazione: {target} ===")
                 ok, message = regenerate_from_feedback(
                     image_path.with_suffix(".mmd"), image_path, notes_md,
@@ -675,6 +720,11 @@ def create_app(base_cfg: AppConfig) -> Flask:
                 if not ok:
                     with state.lock:
                         state.error = message
+            except Cancelled:
+                # Every model call happens before anything is written, so the previous
+                # diagram is untouched: back to showing the session as it was.
+                print("  Rigenerazione interrotta: lo schema precedente e' rimasto invariato.")
+                state.set_step("done")
             except Exception as exc:  # noqa: BLE001 - surfaced to the browser
                 with state.lock:
                     state.step = "error"
@@ -683,13 +733,17 @@ def create_app(base_cfg: AppConfig) -> Flask:
             finally:
                 sys.stdout = original_stdout
 
+        state.cancel_event.clear()
         state.set_step("regenerating")
         threading.Thread(target=worker, daemon=True).start()
         return jsonify({"ok": True})
 
     @app.get("/files/<session_id>/<path:filename>")
     def files(session_id: str, filename: str):
-        if not _SESSION_ID_RE.match(session_id):
+        # Named folders ("Titolo_21_09_26") replaced timestamp-only names, so the old
+        # regex would now 404 every image. The replacement is an equally strict
+        # traversal guard: one plain folder name, directly inside the output root.
+        if not is_session_name(base_cfg.output_root, session_id):
             return "Not found", 404
         return send_from_directory(str(base_cfg.output_root / session_id), filename)
 
@@ -751,6 +805,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .meter-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #79b791, #d6ae55, #d98a8a); }
   .timer { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 0.85rem; min-width: 42px; }
   .step-label { margin-top: 10px; font-size: 0.9rem; color: var(--muted); }
+  .stop-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  .stop-row .hint { margin-top: 0; }
+  button#stopBtn {
+    background: #fff; color: #a04545; border: 1px solid var(--err); border-radius: 8px;
+    padding: 8px 16px; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+  }
+  button#stopBtn:hover:not(:disabled) { background: #fdf4f4; }
+  button#stopBtn:disabled { opacity: .55; cursor: default; }
   .url-row { display: flex; gap: 10px; flex-wrap: wrap; }
   .url-row input { flex: 1; min-width: 220px; }
   button#urlBtn {
@@ -998,6 +1060,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="timer" id="timer">00:00</div>
     </div>
     <div class="step-label" id="stepLabel">Pronto.</div>
+    <div class="stop-row" id="stopRow" style="display:none">
+      <button id="stopBtn" type="button">&#9632; Interrompi</button>
+      <span class="hint" id="stopHint">Ferma l'operazione in corso. I file gia' prodotti restano.</span>
+    </div>
   </div>
 
   <div class="card">
@@ -1180,6 +1246,44 @@ async function loadDevices() {
     if (d.is_default) opt.selected = true;
     sel.appendChild(opt);
   });
+}
+
+// --- Interruzione ---
+const ACTIVE_STEPS = ['recording', 'downloading', 'transcribing', 'notes', 'diagram',
+                      'cards', 'regenerating', 'review'];
+let currentStep = 'idle';
+
+function updateStopButton(step) {
+  currentStep = step;
+  const row = document.getElementById('stopRow');
+  const btn = document.getElementById('stopBtn');
+  const active = ACTIVE_STEPS.includes(step);
+  row.style.display = active ? 'flex' : 'none';
+  if (!active) { btn.disabled = false; btn.innerHTML = '&#9632; Interrompi'; }
+  // Recording has its own "Ferma" that stops AND processes: say plainly this one discards.
+  document.getElementById('stopHint').textContent = step === 'recording'
+    ? "Annulla la registrazione senza elaborarla."
+    : "Ferma l'operazione in corso. I file gia' prodotti restano.";
+}
+
+async function cancelRun() {
+  const question = currentStep === 'recording'
+    ? "Annullare la registrazione? L'audio non verra' elaborato."
+    : currentStep === 'regenerating'
+      ? "Interrompere la rigenerazione? Lo schema attuale resta invariato."
+      : "Interrompere l'operazione in corso? I file gia' prodotti restano sul disco.";
+  if (!confirm(question)) return;
+
+  const btn = document.getElementById('stopBtn');
+  btn.disabled = true;
+  btn.textContent = 'Interruzione in corso...';
+  const res = await fetch('/api/cancel', {method: 'POST'});
+  const data = await res.json();
+  if (!res.ok) { showError(data.error || 'Errore.'); updateStopButton('idle'); return; }
+  if (data.cancelled === 'recording') {
+    stopLevelPolling();   // recording is dropped at once: no pipeline to wait for
+  }
+  // Otherwise the status poll picks up the "cancelled" state when the stage lets go.
 }
 
 let isPaused = false;
@@ -1681,10 +1785,17 @@ async function pollStatus() {
     document.getElementById('reviewCard').style.display = 'none';
   }
 
+  updateStopButton(s.step);
   if (s.step === 'done') {
     clearInterval(statusPolling); statusPolling = null;
     setUIState('idle');
     showResults(s);
+  } else if (s.step === 'cancelled') {
+    clearInterval(statusPolling); statusPolling = null;
+    stopLevelPolling();
+    setUIState('idle');
+    hideError();   // a deliberate stop is not an error: no red banner
+    if (s.image_name || s.notes_md) showResults(s);   // keep whatever was produced
   } else if (s.step === 'error') {
     clearInterval(statusPolling); statusPolling = null;
     setUIState('idle');
@@ -2018,10 +2129,14 @@ async function restoreState() {
   const s = await res.json();
   document.getElementById('stepLabel').textContent = s.label;
   document.getElementById('log').textContent = s.log.join('\n');
+  updateStopButton(s.step);
   if (s.step === 'recording') {
     setUIState('recording');
     startLevelPolling();
     startStatusPolling();
+  } else if (s.step === 'cancelled') {
+    setUIState('idle');
+    if (s.image_name || s.notes_md) showResults(s);
   } else if (s.step === 'review') {
     currentBlocks = s.blocks || [];
     renderBlocks(currentBlocks);
@@ -2055,6 +2170,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('urlBtn').onclick = startFromUrl;
   document.getElementById('thinking').onchange = updateThinkingHint;
   document.getElementById('pauseBtn').onclick = togglePause;
+  document.getElementById('stopBtn').onclick = cancelRun;
   document.getElementById('addSection').onclick = () => addSectionRow();
   document.getElementById('probeBtn').onclick = probeFile;
   document.getElementById('fileBtn').onclick = startFromFile;

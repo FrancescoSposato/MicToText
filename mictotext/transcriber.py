@@ -17,6 +17,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from mictotext.cancel import Cancelled
 from mictotext.config import SttConfig
 
 
@@ -145,7 +146,8 @@ def _cuda_device_count() -> int:
         return 0
 
 
-def transcribe(audio_path: Path, output_dir: Path, cfg: SttConfig) -> Transcript:
+def transcribe(audio_path: Path, output_dir: Path, cfg: SttConfig,
+               cancel_event=None) -> Transcript:
     """Transcribe an audio file, trying CUDA first (if allowed) and then CPU."""
     plan: list[tuple[str, str, str]] = []
     if cfg.device in ("auto", "cuda"):
@@ -180,7 +182,18 @@ def transcribe(audio_path: Path, output_dir: Path, cfg: SttConfig) -> Transcript
             name=f"whisper-{device}",
         )
         process.start()
-        process.join()
+        # Poll instead of a blocking join(), so a stop request can terminate the child.
+        # Terminating it is safe: it holds no shared state, and the OS reclaims all the
+        # VRAM Whisper had allocated.
+        while process.is_alive():
+            process.join(timeout=0.5)
+            if cancel_event is not None and cancel_event.is_set():
+                process.terminate()
+                process.join(timeout=5)
+                result_path.unlink(missing_ok=True)
+                # Must raise here: otherwise the dead child looks like a CUDA failure and
+                # the loop below would restart the whole transcription on the CPU.
+                raise Cancelled()
 
         if result_path.exists():
             data = json.loads(result_path.read_text(encoding="utf-8"))

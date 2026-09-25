@@ -132,8 +132,9 @@ pip install -r requirements.txt
 ollama pull qwen3.5:9b
 ```
 
-È il modello predefinito, e quello consigliato per 8 GB di VRAM. Alternative più leggere:
-`qwen3.5:4b`, `gemma4:e4b`. Vedi [`Docs/guida-modelli.md`](Docs/guida-modelli.md) per il confronto.
+È il modello predefinito, e quello consigliato per 8 GB di VRAM. Occupa circa 5,5 GB di VRAM e
+sta interamente in GPU. Alternative più leggere se hai meno memoria: `qwen3.5:4b` o `gemma4:e4b`,
+da selezionare poi nel menu dell'interfaccia.
 
 ### 4. Installa mermaid-cli
 
@@ -257,7 +258,6 @@ MicToText/
 │   ├── renderer.py      # mermaid-cli (nativo o via WSL)
 │   ├── session.py       # nomi delle cartelle di sessione
 │   └── cancel.py        # interruzione delle operazioni
-├── Docs/                # guida ai modelli e ricerca
 ├── output/              # una cartella per sessione (esclusa da git)
 └── requirements*.txt
 ```
@@ -332,12 +332,3 @@ in `config.py`.
 - **Il file locale viene letto dov'è**, quindi la cartella di sessione non è autosufficiente. Il
   percorso della sorgente è registrato in `trascrizione.json`.
 - **Provato solo su Windows 11.**
-
----
-
-## Documentazione
-
-- [`Docs/guida-modelli.md`](Docs/guida-modelli.md) — i modelli disponibili, punti di forza e di
-  debolezza, quale usare per ogni attività, con i tempi misurati.
-- [`Docs/ricerca-modelli-2026.md`](Docs/ricerca-modelli-2026.md) — l'analisi che ha portato alle
-  scelte tecniche.

@@ -10,3 +10,6 @@ assets/mermaid.min.js
 
 # Eseguibile ricostruibile da MicToText.Launcher.cs con csc.exe
 *.exe
+
+# Appunti di lavoro personali, non parte del progetto pubblicato
+Docs/
